@@ -1,6 +1,6 @@
 //! The miner's searches (`search.rs`) find exactly what the plain `valid_pow`
-//! loop finds, on the CPU, on a GPU where the machine has one, and on both; and
-//! `auto` mines with the fastest. GPU tests say so and pass on a machine
+//! loop finds, on the CPU, on every GPU the machine has and on several at once,
+//! and `auto` mines with the fastest. GPU tests say so and pass on a machine
 //! without a GPU.
 use num_bigint::BigUint;
 use serde_json::Value;
@@ -15,7 +15,7 @@ use ting_core::{consensus, hash::hash, meter::Resources, protocol::Header};
 use ting_node::{
     mining::Search,
     payout::Policy,
-    search::{self, Auto, Both, Choice, Cpu, Gpu},
+    search::{self, Auto, Choice, Cpu, Gpu, Split},
 };
 
 /// A header whose every field depends on `seed`, so the bytes before the
@@ -161,27 +161,78 @@ fn the_gpu_stops_and_counts() {
     assert_eq!(tried.load(Ordering::Relaxed), 64_000);
 }
 
+/// `split` finds what the plain loop finds first, on short ranges, and what
+/// one CPU search finds on long ones, whose finds fall in any of its parts.
+fn finds_the_first_nonce(split: &Split) {
+    let cpu = Cpu::new(8);
+    for seed in 0..2u8 {
+        let h = header(seed, pow2(251));
+        for start in STARTS {
+            let want = reference(&h, start, 300);
+            assert_eq!(run(|s, t| split.scan(&h, start, 300, s, t)).0, want);
+        }
+    }
+    for (seed, bits, count) in [(7u8, 240, 1 << 20), (8, 236, 1 << 22), (9, 226, 1 << 22)] {
+        let h = header(seed, pow2(bits));
+        for start in [0, (1 << 64) - 100_000, u128::MAX - 50] {
+            let want = run(|s, t| cpu.scan(&h, start, count, s, t)).0;
+            let (found, tried) = run(|s, t| split.scan(&h, start, count, s, t));
+            assert_eq!(found, want, "seed {seed}, 2^{bits}, start {start}");
+            if found.is_none() {
+                assert_eq!(tried, count);
+            }
+        }
+    }
+}
+
+/// Each part's share of a split's range.
+fn shares(split: &Split) -> Vec<f64> {
+    let status = split.describe();
+    let parts = status["parts"].as_array().unwrap();
+    parts.iter().map(|p| p["share"].as_f64().unwrap()).collect()
+}
+
+#[test]
+fn a_split_finds_the_first_nonce_in_any_of_its_parts() {
+    // Three CPU searches stand for three GPUs, everywhere.
+    let cpus = [1, 2, 3].map(|threads| Arc::new(Cpu::new(threads)));
+    let split = Split::new(Vec::new(), cpus.to_vec());
+    finds_the_first_nonce(&split);
+}
+
+#[test]
+fn a_split_shares_its_range_by_how_fast_each_part_is() {
+    let split = Split::new(
+        Vec::new(),
+        vec![Arc::new(Cpu::new(1)), Arc::new(Cpu::new(4))],
+    );
+    assert_eq!(shares(&split), [0.5, 0.5]);
+    let h = header(11, BigUint::from(1u8));
+    for _ in 0..6 {
+        run(|s, t| split.scan(&h, 0, 1 << 22, s, t));
+    }
+    // Four threads search more of the range than one.
+    let [one, four] = shares(&split)[..] else {
+        panic!("two parts")
+    };
+    assert!(
+        four > 0.6 && (one + four - 1.0).abs() < 0.002,
+        "{one} and {four}"
+    );
+}
+
 #[test]
 fn the_gpu_and_the_cpu_together_find_the_first_nonce() {
     let Some(gpu) = Gpu::open() else {
         eprintln!("no GPU on this machine: the GPU search is not tested here");
         return;
     };
-    let both = Both::new(gpu, Arc::new(Cpu::new(4)));
-    let cpu = Cpu::new(8);
-    // The first finds fall in the GPU's part, later ones in the CPU's, and the
-    // shares move as both are timed.
-    for (seed, bits, count) in [(0u8, 251, 300), (7, 240, 1 << 20), (8, 232, 1 << 23)] {
-        let h = header(seed, pow2(bits));
-        for start in [0, (1 << 64) - 100_000, u128::MAX - 50] {
-            let want = run(|s, t| cpu.scan(&h, start, count, s, t)).0;
-            assert_eq!(
-                run(|s, t| both.scan(&h, start, count, s, t)).0,
-                want,
-                "seed {seed}, 2^{bits}, start {start}"
-            );
-        }
-    }
+    finds_the_first_nonce(&Split::new(vec![gpu.clone()], vec![Arc::new(Cpu::new(4))]));
+    // One GPU twice stands for a machine with two.
+    finds_the_first_nonce(&Split::new(
+        vec![gpu.clone(), gpu],
+        vec![Arc::new(Cpu::new(4))],
+    ));
 }
 
 /// A search that gives up at once, as a lost GPU does.
@@ -278,8 +329,9 @@ fn miner_json_chooses_the_search() {
         let kind = search.describe()["kind"].clone();
         match (choice, Gpu::open()) {
             (Choice::Reference, _) => assert_eq!(kind, "cpu"),
-            (Choice::Gpu, Some(_)) => assert_eq!(kind, "gpu"),
-            (Choice::Both, Some(_)) => assert_eq!(kind, "both"),
+            (Choice::Gpu, Some(_)) if Gpu::all().len() == 1 => assert_eq!(kind, "gpu"),
+            (Choice::Gpu, Some(_)) => assert_eq!(kind, "split"),
+            (Choice::Both, Some(_)) => assert_eq!(kind, "split"),
             _ => assert_eq!(kind, "cpu"),
         }
     }

@@ -1,7 +1,7 @@
 //! Finding nonces as fast as this machine can (ting-miner, see MINER.md): the
-//! CPU on its own SHA-256 instructions, a GPU through wgpu (Metal, Vulkan or
-//! DX12), or both at once, and an automatic search that times each of them on
-//! this machine, mines with the fastest and times them again every few
+//! CPU on its own SHA-256 instructions, every GPU through wgpu (Metal, Vulkan
+//! or DX12), or all of them at once, and an automatic search that times each
+//! way on this machine, mines with the fastest and times them again every few
 //! minutes, so the choice follows a GPU that slows as it heats or a CPU that
 //! other work takes.
 //!
@@ -38,9 +38,9 @@ pub enum Choice {
     Reference,
     /// The CPU, on its SHA-256 instructions where it has them.
     Cpu,
-    /// The GPU, or the CPU where there is none.
+    /// Every GPU, or the CPU where there is none.
     Gpu,
-    /// The GPU and the CPU together, or the CPU alone where there is no GPU.
+    /// Every GPU and the CPU together, or the CPU alone where there is no GPU.
     Both,
 }
 
@@ -53,31 +53,41 @@ pub fn factory(choice: Choice) -> SearchFactory {
             Choice::Auto => Arc::new(Auto::new(candidates(threads), BENCH)),
             Choice::Reference => Arc::new(mining::Cpu::new(threads)),
             Choice::Cpu => cpu,
-            Choice::Gpu => match Gpu::open() {
-                Some(gpu) => gpu,
+            Choice::Gpu => match gpus() {
+                Some(gpus) => gpus,
                 None => cpu,
             },
-            Choice::Both => match Gpu::open() {
-                Some(gpu) => Arc::new(Both::new(gpu, cpu)),
-                None => cpu,
+            Choice::Both => match Gpu::all() {
+                [] => cpu,
+                gpus => Arc::new(Split::new(gpus.to_vec(), vec![cpu])),
             },
         }
     })
 }
 
 /// The searches `auto` chooses from on this machine, by name: Ting's, the
-/// CPU's, and the GPU's alone and with the CPU where there is a GPU.
+/// CPU's, and where there are GPUs, all of them, alone and with the CPU.
 pub fn candidates(threads: u32) -> Vec<(&'static str, Arc<dyn Search>)> {
     let cpu = Arc::new(Cpu::new(threads));
     let mut all: Vec<(&'static str, Arc<dyn Search>)> = vec![
         ("reference", Arc::new(mining::Cpu::new(threads))),
         ("cpu", cpu.clone()),
     ];
-    if let Some(gpu) = Gpu::open() {
-        all.push(("gpu", gpu.clone()));
-        all.push(("both", Arc::new(Both::new(gpu, cpu))));
+    if let Some(gpus) = gpus() {
+        all.push(("gpu", gpus));
+        all.push(("both", Arc::new(Split::new(Gpu::all().to_vec(), vec![cpu]))));
     }
     all
+}
+
+/// Every GPU as one search: the GPU itself where there is one, a split among
+/// them where there are several, and `None` where there is none.
+fn gpus() -> Option<Arc<dyn Search>> {
+    match Gpu::all() {
+        [] => None,
+        [gpu] => Some(gpu.clone()),
+        gpus => Some(Arc::new(Split::new(gpus.to_vec(), Vec::new()))),
+    }
 }
 
 /// How far one call may search. The built-in miner moves its start on by 64
@@ -412,24 +422,76 @@ impl Search for Cpu {
     }
 }
 
-// ---- The GPU and the CPU together -------------------------------------------------
+// ---- Several at once ---------------------------------------------------------------
 
-/// The GPU and the CPU on one range: the GPU on its first part, the CPU on the
-/// rest, shared by how fast each was on the last call, so that both finish at
-/// about the same moment.
-pub struct Both {
-    gpu: Arc<Gpu>,
-    cpu: Arc<Cpu>,
-    /// The GPU's share of a range.
-    share: Mutex<f64>,
+/// Several searches on one range, every GPU and, for `both`, the CPU: each on
+/// its own part of it, sized by how fast each was on the last call, so that
+/// all finish at about the same moment. A GPU that failed gets no part.
+pub struct Split {
+    parts: Vec<Part>,
+    /// Each part's share of a range, together 1.
+    shares: Mutex<Vec<f64>>,
 }
 
-impl Both {
-    pub fn new(gpu: Arc<Gpu>, cpu: Arc<Cpu>) -> Self {
+enum Part {
+    Gpu(Arc<Gpu>),
+    Cpu(Arc<Cpu>),
+}
+
+impl Part {
+    fn scan_work(
+        &self,
+        work: &Work,
+        start: u128,
+        count: u64,
+        quit: Quit<'_>,
+        tried: &AtomicU64,
+    ) -> Option<u128> {
+        match self {
+            Part::Gpu(gpu) => gpu.scan_work(work, start, count, quit, tried),
+            Part::Cpu(cpu) => cpu.scan_work(work, start, count, quit, tried),
+        }
+    }
+    fn failed(&self) -> bool {
+        match self {
+            Part::Gpu(gpu) => gpu.failed(),
+            Part::Cpu(_) => false,
+        }
+    }
+    fn describe(&self) -> Value {
+        match self {
+            Part::Gpu(gpu) => gpu.describe(),
+            Part::Cpu(cpu) => cpu.describe(),
+        }
+    }
+}
+
+/// The fewest attempts a part makes on a call for its rate to count: a shorter
+/// run times starting the call more than hashing.
+const TIMED: u64 = 1 << 16;
+/// The least share a working part keeps, so that one timed badly once is timed
+/// again.
+const FLOOR: f64 = 0.01;
+
+impl Split {
+    /// `gpus` and `cpus` on one range, the GPUs' parts first. Until they are
+    /// timed, a GPU takes four times a CPU's share.
+    pub fn new(gpus: Vec<Arc<Gpu>>, cpus: Vec<Arc<Cpu>>) -> Self {
+        let parts: Vec<Part> = (gpus.into_iter().map(Part::Gpu))
+            .chain(cpus.into_iter().map(Part::Cpu))
+            .collect();
+        assert!(!parts.is_empty(), "a search to split a range among");
+        let weights: Vec<f64> = parts
+            .iter()
+            .map(|part| match part {
+                Part::Gpu(_) => 4.0,
+                Part::Cpu(_) => 1.0,
+            })
+            .collect();
+        let total: f64 = weights.iter().sum();
         Self {
-            gpu,
-            cpu,
-            share: Mutex::new(0.75),
+            shares: Mutex::new(weights.iter().map(|weight| weight / total).collect()),
+            parts,
         }
     }
 
@@ -444,44 +506,100 @@ impl Both {
         tried: &AtomicU64,
     ) -> Option<u128> {
         let quit = || stop.load(Ordering::Relaxed);
-        let Some(work) = Work::new(header) else {
-            return unreachable_target(count, &quit, tried);
-        };
-        let share = *self.share.lock().unwrap();
-        let low = ((count as f64 * share) as u64).min(count);
-        // A nonce in the GPU's part comes before any in the CPU's.
-        let gpu_found = AtomicBool::new(false);
-        let timed = |run: &dyn Fn() -> Option<u128>| {
-            let began = Instant::now();
-            (run(), began.elapsed().as_secs_f64())
-        };
-        let ((low_found, gpu_time), (high_found, cpu_time)) = std::thread::scope(|scope| {
-            let gpu = scope.spawn(|| {
-                timed(&|| {
-                    let found = self.gpu.scan_work(&work, start, low, &quit, tried);
-                    gpu_found.store(found.is_some(), Ordering::Relaxed);
-                    found
-                })
-            });
-            let cpu = timed(&|| {
-                let quit = || quit() || gpu_found.load(Ordering::Relaxed);
-                let from = start.wrapping_add(u128::from(low));
-                self.cpu.scan_work(&work, from, count - low, &quit, tried)
-            });
-            (gpu.join().expect("GPU search"), cpu)
-        });
-        // Whole parts only, each run to its end, give the two rates.
-        if low_found.is_none() && high_found.is_none() && !quit() && low > 0 && low < count {
-            let gpu = low as f64 / gpu_time.max(1e-6);
-            let cpu = (count - low) as f64 / cpu_time.max(1e-6);
-            let mut share = self.share.lock().unwrap();
-            *share = (*share + gpu / (gpu + cpu)) / 2.0;
+        match Work::new(header) {
+            Some(work) => self.scan_work(&work, start, count, &quit, tried),
+            None => unreachable_target(count, &quit, tried),
         }
-        low_found.or(high_found)
+    }
+
+    fn scan_work(
+        &self,
+        work: &Work,
+        start: u128,
+        count: u64,
+        quit: Quit<'_>,
+        tried: &AtomicU64,
+    ) -> Option<u128> {
+        // The shares of this call, a failed GPU's none, and so each part's
+        // range, in order: from `ends[i]` to `ends[i + 1]`.
+        let shares: Vec<f64> = (self.shares.lock().unwrap().iter().zip(&self.parts))
+            .map(|(share, part)| if part.failed() { 0.0 } else { *share })
+            .collect();
+        let total: f64 = shares.iter().sum();
+        if total <= 0.0 {
+            return None;
+        }
+        let mut ends = vec![0u64];
+        let mut sum = 0.0;
+        for share in &shares {
+            sum += share / total;
+            ends.push(((count as f64 * sum) as u64).min(count));
+        }
+        *ends.last_mut().expect("a part") = count;
+        // The lowest part that has found a nonce: the parts above it stop, the
+        // ones below go on, so the nonce returned is the first in range.
+        let first = AtomicUsize::new(usize::MAX);
+        let runs: Vec<(Option<u128>, u64, f64)> = std::thread::scope(|scope| {
+            let parts: Vec<_> = (self.parts.iter().enumerate())
+                .map(|(i, part)| {
+                    let (from, to, first) = (ends[i], ends[i + 1], &first);
+                    scope.spawn(move || {
+                        let attempts = AtomicU64::new(0);
+                        let quit = || quit() || first.load(Ordering::Relaxed) < i;
+                        let began = Instant::now();
+                        let from_nonce = start.wrapping_add(u128::from(from));
+                        let found = part.scan_work(work, from_nonce, to - from, &quit, &attempts);
+                        if found.is_some() {
+                            first.fetch_min(i, Ordering::Relaxed);
+                        }
+                        let attempts = attempts.load(Ordering::Relaxed);
+                        (found, attempts, began.elapsed().as_secs_f64())
+                    })
+                })
+                .collect();
+            (parts.into_iter())
+                .map(|part| part.join().expect("a part of the search"))
+                .collect()
+        });
+        for (_, attempts, _) in &runs {
+            tried.fetch_add(*attempts, Ordering::Relaxed);
+        }
+        let found = runs.iter().find_map(|(found, ..)| *found);
+        // Whole parts, each run to its end and long enough to time, set the
+        // shares of the next call.
+        let whole = (runs.iter().zip(ends.windows(2)).zip(&shares)).all(|((run, range), share)| {
+            *share == 0.0 || (run.1 == range[1] - range[0] && run.1 >= TIMED)
+        });
+        if found.is_none() && !quit() && whole {
+            let rates: Vec<f64> = (runs.iter().zip(&shares))
+                .map(|(&(_, attempts, time), &share)| {
+                    if share == 0.0 {
+                        0.0
+                    } else {
+                        attempts as f64 / time.max(1e-9)
+                    }
+                })
+                .collect();
+            let all: f64 = rates.iter().sum();
+            let mut kept = self.shares.lock().unwrap();
+            let mut next: Vec<f64> = (kept.iter().zip(&rates).zip(&shares))
+                .map(|((old, rate), &share)| {
+                    if share == 0.0 {
+                        0.0
+                    } else {
+                        ((old + rate / all) / 2.0).max(FLOOR)
+                    }
+                })
+                .collect();
+            let sum: f64 = next.iter().sum();
+            next.iter_mut().for_each(|share| *share /= sum);
+            *kept = next;
+        }
+        found
     }
 }
 
-impl Search for Both {
+impl Search for Split {
     fn search(
         &self,
         header: &Header,
@@ -490,11 +608,18 @@ impl Search for Both {
         stop: &AtomicBool,
         tried: &AtomicU64,
     ) -> Option<u128> {
+        if self.parts.iter().all(Part::failed) {
+            // As a failed GPU alone: no busy loop of templates.
+            std::thread::sleep(Duration::from_millis(200));
+            return None;
+        }
         self.scan(header, start, attempts.saturating_mul(SPAN), stop, tried)
     }
     fn describe(&self) -> Value {
-        json!({"kind":"both","gpu_share":*self.share.lock().unwrap(),
-            "gpu":self.gpu.describe(),"cpu":self.cpu.describe()})
+        let shares = self.shares.lock().unwrap();
+        json!({"kind":"split","parts":(self.parts.iter().zip(shares.iter()))
+            .map(|(part, share)| json!({"share":(share * 1000.0).round() / 1000.0,"search":part.describe()}))
+            .collect::<Vec<_>>()})
     }
 }
 
@@ -637,9 +762,15 @@ pub enum Gpu {}
 
 #[cfg(not(feature = "gpu"))]
 impl Gpu {
-    /// The machine's GPU; never one in a build without the `gpu` feature.
+    /// The machine's GPUs: none in a build without the `gpu` feature.
+    pub fn all() -> &'static [Arc<Self>] {
+        &[]
+    }
     pub fn open() -> Option<Arc<Self>> {
         None
+    }
+    pub fn failed(&self) -> bool {
+        match *self {}
     }
     pub fn scan(&self, _: &Header, _: u128, _: u64, _: &AtomicBool, _: &AtomicU64) -> Option<u128> {
         match *self {}
@@ -690,9 +821,10 @@ mod gpu {
     /// and the stride.
     const PARAMS: usize = 46;
 
-    /// The machine's GPU, through wgpu, with the search's pipeline on it.
+    /// One of the machine's GPUs, through wgpu, with the search's pipeline on it.
     pub struct Gpu {
         name: String,
+        discrete: bool,
         device: wgpu::Device,
         queue: wgpu::Queue,
         pipeline: wgpu::ComputePipeline,
@@ -713,27 +845,45 @@ mod gpu {
     }
 
     impl Gpu {
-        /// The machine's fastest GPU, opened once per process; `None` when
-        /// there is none, or only a software one, which the CPU search beats.
-        pub fn open() -> Option<Arc<Self>> {
-            static GPU: OnceLock<Option<Arc<Gpu>>> = OnceLock::new();
-            GPU.get_or_init(|| Self::connect().map(Arc::new)).clone()
+        /// Every GPU of the machine, opened once per process, the discrete
+        /// ones first; none where it has only a software one, which the CPU
+        /// search beats.
+        pub fn all() -> &'static [Arc<Self>] {
+            static GPUS: OnceLock<Vec<Arc<Gpu>>> = OnceLock::new();
+            GPUS.get_or_init(Self::connect_all)
         }
 
-        fn connect() -> Option<Self> {
+        /// The first of [`Gpu::all`], a discrete one where there is one.
+        pub fn open() -> Option<Arc<Self>> {
+            Self::all().first().cloned()
+        }
+
+        /// Whether the device reported an error, was lost or hung.
+        pub fn failed(&self) -> bool {
+            self.failed.load(Ordering::Relaxed)
+        }
+
+        fn connect_all() -> Vec<Arc<Self>> {
             let instance = wgpu::Instance::new(
                 wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
             );
-            let adapter =
-                pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::HighPerformance,
-                    ..Default::default()
-                }))
-                .ok()?;
+            let adapters: Vec<wgpu::Adapter> =
+                pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()))
+                    .into_iter()
+                    .filter(|adapter| adapter.get_info().device_type != wgpu::DeviceType::Cpu)
+                    .collect();
+            let apis: Vec<wgpu::Backend> = adapters.iter().map(|a| a.get_info().backend).collect();
+            let api = api_with_most(&apis);
+            let mut gpus: Vec<Self> = (adapters.into_iter())
+                .filter(|adapter| adapter.get_info().backend == api)
+                .filter_map(Self::connect)
+                .collect();
+            gpus.sort_by_key(|gpu| !gpu.discrete);
+            gpus.into_iter().map(Arc::new).collect()
+        }
+
+        fn connect(adapter: wgpu::Adapter) -> Option<Self> {
             let info = adapter.get_info();
-            if info.device_type == wgpu::DeviceType::Cpu {
-                return None;
-            }
             let (device, queue) =
                 pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                     label: Some("ting-miner"),
@@ -791,8 +941,14 @@ mod gpu {
                     },
                 ],
             });
+            let mut name = format!("{} ({:?})", info.name, info.backend);
+            if !info.device_pci_bus_id.is_empty() {
+                // Tells two cards of one model apart.
+                write!(name, " at {}", info.device_pci_bus_id).unwrap();
+            }
             Some(Self {
-                name: format!("{} ({:?})", info.name, info.backend),
+                name,
+                discrete: info.device_type == wgpu::DeviceType::DiscreteGpu,
                 device,
                 queue,
                 pipeline,
@@ -932,6 +1088,35 @@ mod gpu {
             json!({"kind":"gpu","adapter":self.name,"batch":self.batch.load(Ordering::Relaxed),
                 "failed":self.failed.load(Ordering::Relaxed)})
         }
+    }
+
+    /// The graphics API to take the GPUs of, given the API of each GPU found.
+    /// A card can show under more than one, as under both Vulkan and DX12 on
+    /// Windows, so the GPUs come from one API: the one that shows the most,
+    /// and on a tie Metal, then Vulkan, then DX12.
+    fn api_with_most(found: &[wgpu::Backend]) -> wgpu::Backend {
+        let apis = [
+            wgpu::Backend::Metal,
+            wgpu::Backend::Vulkan,
+            wgpu::Backend::Dx12,
+        ];
+        let shown = |api: &wgpu::Backend| found.iter().filter(|f| *f == api).count();
+        let most = apis.iter().map(shown).max().unwrap_or(0);
+        apis.into_iter()
+            .find(|api| shown(api) == most)
+            .expect("an API")
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn the_api_that_shows_the_most_gpus_gives_them() {
+        use wgpu::Backend::{Dx12, Metal, Vulkan};
+        // Two cards, each under both Vulkan and DX12: one API's two.
+        assert_eq!(api_with_most(&[Vulkan, Dx12, Vulkan, Dx12]), Vulkan);
+        // A card only DX12 shows.
+        assert_eq!(api_with_most(&[Dx12, Vulkan, Dx12]), Dx12);
+        assert_eq!(api_with_most(&[Metal]), Metal);
+        assert_eq!(api_with_most(&[]), Metal);
     }
 
     /// The state after the first eight rounds of `block`, which see only its

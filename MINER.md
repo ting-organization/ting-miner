@@ -52,11 +52,12 @@ last, which holds the nonce:
 - **`cpu`**: the miner's threads, each on its own share of the nonces, on the CPU's
   SHA-256 instructions: ARMv8's SHA2 extension, which Ting's search leaves unused
   (its `sha2` uses them only with the `asm` feature), or SHA-NI on x86.
-- **`gpu`**: a WGSL compute shader through wgpu: Metal on a Mac, Vulkan on Linux and
-  Windows (NVIDIA, AMD, Intel), DX12 on Windows. It starts at the block's ninth
-  round, the first eight being the same for every nonce.
-- **`both`**: the GPU and the CPU on one range, shared by how fast each was on the
-  last.
+- **`gpu`**: every GPU of the machine, each running a WGSL compute shader through
+  wgpu: Metal on a Mac, Vulkan on Linux and Windows (NVIDIA, AMD, Intel), DX12 on
+  Windows. The shader starts at the block's ninth round, the first eight being the
+  same for every nonce. Several GPUs split each range, each part sized by how fast
+  that GPU was on the last; a GPU that fails gets no part.
+- **`both`**: every GPU and the CPU on one range, split the same way.
 - **`reference`**: Ting's own CPU search.
 - **`auto`**, the default: times every search the machine has, half a second each on
   a header no nonce meets, mines with the fastest, and times them again every ten
@@ -78,6 +79,13 @@ While the miner runs, `ting miner status` shows the search, each one's rate and 
 one in use. The GPU search is the `gpu` feature, on by default; `cargo build
 --no-default-features` leaves it and wgpu out. A GPU needs its driver: on Linux one
 with Vulkan, as NVIDIA's own or Mesa for AMD and Intel.
+
+A card can show under more than one graphics API, as under both Vulkan and DX12 on
+Windows, so the GPUs all come from the API that shows the most of them. Hashing
+needs nothing from one GPU to the next, so more GPUs hash about as many times
+faster. One limit stays Ting's: its miner loop asks a search for 2^30 nonces at a
+time and then builds a new template, so past some tens of GH/s, a handful of fast
+GPUs, building templates starts to take a share of the time.
 
 ## Configure
 
