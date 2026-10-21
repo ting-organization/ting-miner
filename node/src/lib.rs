@@ -10,6 +10,7 @@ pub mod peers;
 pub mod pool;
 pub mod presync;
 pub mod reads;
+pub mod search;
 pub mod seed;
 pub mod store;
 pub mod transport;

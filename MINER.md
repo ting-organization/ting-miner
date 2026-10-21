@@ -3,7 +3,8 @@
 This repository is the Ting reference node with a mining policy for pay. It is the
 whole Ting implementation, kept in step with [Ting](https://github.com/ting-organization/ting)
 by merging its changes, and the `ting` binary it builds runs, synchronizes and
-validates exactly as Ting's does. Only how a template picks its transactions differs.
+validates exactly as Ting's does. Only how a template picks its transactions, and how
+fast the miner finds a nonce for it, differ.
 
 ## What it adds
 
@@ -42,6 +43,42 @@ in `miner.json`.
 Without a payout account in the producer data, nothing is claimed or ranked, and
 the node selects as Ting does.
 
+## Finding nonces
+
+The search in `node/src/search.rs`, which `ting miner start` uses, finds nonces as
+fast as the machine can. Each attempt compresses one SHA-256 block, the header's
+last, which holds the nonce:
+
+- **`cpu`**: the miner's threads, each on its own share of the nonces, on the CPU's
+  SHA-256 instructions: ARMv8's SHA2 extension, which Ting's search leaves unused
+  (its `sha2` uses them only with the `asm` feature), or SHA-NI on x86.
+- **`gpu`**: a WGSL compute shader through wgpu: Metal on a Mac, Vulkan on Linux and
+  Windows (NVIDIA, AMD, Intel), DX12 on Windows. It starts at the block's ninth
+  round, the first eight being the same for every nonce.
+- **`both`**: the GPU and the CPU on one range, shared by how fast each was on the
+  last.
+- **`reference`**: Ting's own CPU search.
+- **`auto`**, the default: times every search the machine has, half a second each on
+  a header no nonce meets, mines with the fastest, and times them again every ten
+  minutes, or at once when its search stops getting anywhere, as a GPU that was
+  lost. The choice follows the machine: a GPU that slows as it heats, a CPU that
+  other work takes.
+
+Every search finds exactly the nonce Ting's plain `valid_pow` loop finds first in a
+range (`node/tests/search.rs`); the GPU's tests pass untested on a machine without
+one. On a MacBook Air M3 with 8 threads, `reference` hashes 42 MH/s, `cpu` 387,
+`gpu` 502 and `both` 690, so `auto` mines with both. This prints a machine's rates
+without mining:
+
+```sh
+cargo test -p ting-node --release --test search -- --ignored --nocapture search_speed
+```
+
+While the miner runs, `ting miner status` shows the search, each one's rate and the
+one in use. The GPU search is the `gpu` feature, on by default; `cargo build
+--no-default-features` leaves it and wgpu out. A GPU needs its driver: on Linux one
+with Vulkan, as NVIDIA's own or Mesa for AMD and Intel.
+
 ## Configure
 
 `miner.json` in the node's data directory, read when the node starts:
@@ -50,7 +87,8 @@ the node selects as Ting does.
 {
   "assets": { "<coin ContractId in hex>": 1.0 },
   "claims": ["<coin ContractId in hex>"],
-  "unpaid": true
+  "unpaid": true,
+  "search": "auto"
 }
 ```
 
@@ -58,6 +96,10 @@ the node selects as Ting does.
   program's ContractId. Payments in other assets count as nothing.
 - `claims`: the coins whose block reward to claim in every block.
 - `unpaid`: whether transactions that pay nothing still fill the block.
+- `search`: how to find nonces: `auto`, `cpu`, `gpu`, `both` or `reference`
+  ([finding nonces](#finding-nonces)). `gpu` and `both` fall back to the CPU on a
+  machine without a GPU. The CPU searches use the miner's threads, 1 unless
+  `ting miner start --threads` says more.
 
 Every field is optional; without the file the node behaves as Ting. The payout
 account is the node's producer data, 44 bytes naming the account
@@ -94,10 +136,12 @@ git merge upstream/master
 
 The miner changes as little of Ting as it can, so merges stay clean:
 
-- `node/src/payout.rs`, `node/tests/payout.rs`, `miner.production.json` and this
-  file are the miner's own;
-- `node/src/lib.rs` declares the module, and `node/src/main.rs` runs the daemon with
-  `payout::mining` instead of the defaults: one line each;
+- `node/src/payout.rs`, `node/src/search.rs`, their tests in `node/tests/`,
+  `miner.production.json` and this file are the miner's own;
+- `node/src/lib.rs` declares the two modules, and `node/src/main.rs` runs the daemon
+  with `payout::mining` instead of the defaults: a line each;
+- `node/Cargo.toml` adds wgpu and pollster under the `gpu` feature, and
+  `Cargo.lock` their crates;
 - `src/vm/runtime.rs` gives the block candidate two read-only accessors, `producer`
   and `limits`.
 

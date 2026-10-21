@@ -10,6 +10,7 @@ use crate::{
     Result,
     daemon::Mining,
     mining::{FirstIn, Pending, Selector, fair_share},
+    search::{self, Choice},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -49,18 +50,23 @@ pub struct Policy {
     /// first in, first served. On unless set to false.
     #[serde(default = "yes")]
     pub unpaid: bool,
+    /// How the miner finds nonces (`search.rs`): `auto`, the default, times
+    /// the CPU and any GPU on this machine and mines with the fastest.
+    #[serde(default)]
+    pub search: Choice,
 }
 fn yes() -> bool {
     true
 }
 /// No assets, no claims, every transaction first in, first served: the
-/// reference node's selection.
+/// reference node's selection, with the fastest search this machine has.
 impl Default for Policy {
     fn default() -> Self {
         Self {
             assets: BTreeMap::new(),
             claims: Vec::new(),
             unpaid: true,
+            search: Choice::Auto,
         }
     }
 }
@@ -356,11 +362,12 @@ pub fn claim(coin: Hash) -> Transaction {
         },
     }
 }
-/// The node's mining pieces for `dir`: the payout selector from its policy, and
-/// the reference search.
+/// The node's mining pieces for `dir`: the payout selector and the search its
+/// policy asks for.
 pub fn mining(dir: &Path) -> Result<Mining> {
+    let policy = Policy::load(dir)?;
     Ok(Mining {
-        selector: Box::new(Payout::new(&Policy::load(dir)?)?),
-        ..Mining::default()
+        selector: Box::new(Payout::new(&policy)?),
+        search: search::factory(policy.search),
     })
 }

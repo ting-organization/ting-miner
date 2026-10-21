@@ -21,6 +21,14 @@ pulldown-cmark = "=0.13.0"
 num-bigint = "=0.4.6"
 redb = "=4.3.0"
 sha2 = { version = "=0.10.9", features = ["compress"] }
+# ting-miner: the GPU search (src/search.rs), on Metal, Vulkan or DX12.
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "metal", "vulkan", "dx12"], optional = true }
+pollster = { version = "=1.0.1", optional = true }
+
+[features]
+# ting-miner: mine on a GPU where the machine has one; without it, the CPU only.
+default = ["gpu"]
+gpu = ["dep:wgpu", "dep:pollster"]
 
 [dev-dependencies]
 vm-model = { path = "../vm-model" }
