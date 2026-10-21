@@ -70,7 +70,20 @@ ting start
 ting miner start --threads 2
 ```
 
-`ting miner producer` answers with the selection in use, its assets and claims.
+`ting miner producer <hex>` answers with the selection in use, its assets and claims.
+Without a hex it clears the producer data; `ting miner status` shows it.
+
+### The production network
+
+`miner.production.json` mines Daler (DLR), the coin of ContractId
+`305378d17f6af84a563d0f8a8455084948aff7330b62b4f2f98a44b82ba113c4`, deployed at
+height 443 of the production network: it claims Daler's block reward and values
+payments in it. A ContractId belongs to one chain, so the file is for the production
+network only.
+
+```sh
+cp miner.production.json ~/.ting/miner.json
+```
 
 ## Keep in step with Ting
 
@@ -81,7 +94,8 @@ git merge upstream/master
 
 The miner changes as little of Ting as it can, so merges stay clean:
 
-- `node/src/payout.rs`, `node/tests/payout.rs` and this file are the miner's own;
+- `node/src/payout.rs`, `node/tests/payout.rs`, `miner.production.json` and this
+  file are the miner's own;
 - `node/src/lib.rs` declares the module, and `node/src/main.rs` runs the daemon with
   `payout::mining` instead of the defaults: one line each;
 - `src/vm/runtime.rs` gives the block candidate two read-only accessors, `producer`
