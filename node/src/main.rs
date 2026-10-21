@@ -379,7 +379,7 @@ async fn execute(cli: Cli) -> Result<Option<Value>> {
             json!({"initialized":dir,"chain_id":ting_core::hash::hex(&g.chain_id()),"api_enabled":api})
         }
         Action::Run => {
-            daemon::run(dir).await?;
+            daemon::run_with(dir, ting_node::payout::mining(dir)?).await?;
             return Ok(None);
         }
         Action::Start => start(dir).await?,

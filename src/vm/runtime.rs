@@ -1028,6 +1028,14 @@ impl Candidate<'_> {
     pub fn transactions(&self) -> &[Transaction] {
         &self.transactions
     }
+    /// The producer data the block carries.
+    pub fn producer(&self) -> &[u8] {
+        &self.producer
+    }
+    /// The block's capacities.
+    pub fn limits(&self) -> Resources {
+        self.limits
+    }
     /// The block with the transactions added, complete except for its nonce.
     pub fn finish(mut self) -> protocol::Result<crate::protocol::Block> {
         use crate::{

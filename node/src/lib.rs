@@ -5,6 +5,7 @@ pub mod daemon;
 pub mod discovery;
 pub mod index;
 pub mod mining;
+pub mod payout;
 pub mod peers;
 pub mod pool;
 pub mod presync;
