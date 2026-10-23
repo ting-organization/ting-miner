@@ -91,7 +91,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p "dist/$ARCHIVE"
-          cp "target/$TARGET/release/ting${{ matrix.exe }}" LICENSE-APACHE LICENSE-MIT MINER.md miner.production.json "dist/$ARCHIVE/"
+          cp "target/$TARGET/release/ting${{ matrix.exe }}" LICENSE-APACHE LICENSE-MIT README.md MINER.md miner.production.json "dist/$ARCHIVE/"
           cd dist
           if [[ "$RUNNER_OS" == Windows ]]; then
             7z a "$ARCHIVE.zip" "$ARCHIVE"

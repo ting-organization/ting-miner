@@ -100,7 +100,8 @@ Each [release](https://github.com/ting-organization/ting-miner/releases) carries
 | Linux, ARM | `ting-miner-<tag>-aarch64-unknown-linux-gnu.tar.gz` |
 | Windows, x86_64 | `ting-miner-<tag>-x86_64-pc-windows-msvc.zip` |
 
-Each holds the binary, this file, `miner.production.json` and the licences. The
+Each holds the binary, `README.md`, whose [start mining](README.md#start-mining) takes
+it from there, this file, `miner.production.json` and the licences. The
 binary is the whole node, the seed blocks, wiki and explorer included, and one build
 mines at full speed on every machine of its platform: as it runs, the CPU search
 finds the SHA-256 instructions the CPU has, and the GPU search the Metal, Vulkan or
@@ -158,19 +159,22 @@ git push origin v0.1.0-miner.1
   machine without a GPU. The CPU searches use the miner's threads, 1 unless
   `ting miner start --threads` says more.
 
-Every field is optional; without the file the node behaves as Ting. The payout
-account is the node's producer data, 44 bytes naming the account
-(`ting miner producer <hex>`; `ocoin payout <account>` prints the hex).
+Every field is optional; without the file the node behaves as Ting. The node reads
+it when it starts, so a change to it takes a `ting stop` and a `ting start`.
+
+The account the blocks pay is set apart from it, with the node running or not:
 
 ```sh
-ting miner producer <hex from ocoin payout>
-ting stop
-ting start
-ting miner start --threads 2
+ting miner payout <account>
 ```
 
-`ting miner producer <hex>` answers with the selection in use, its assets and claims.
-Without a hex it clears the producer data; `ting miner status` shows it.
+The account is 64 hex digits, as a wallet shows one: in Ting ID, Receive shows your
+Spending account. The command sets producer data naming it as the payout account,
+44 bytes ([producer data](node/wiki/programs/conventions.md#producer-data)), and
+answers with the account, as `ting miner payout` alone does and `ting miner status`
+does under `payout`; anything but 32 bytes of hex is refused. `ting miner producer
+<hex>` sets other producer data, and without a hex clears it: the blocks then pay
+nobody, and claim nothing.
 
 ### The production network
 
@@ -197,7 +201,11 @@ The miner changes as little of Ting as it can, so merges stay clean:
   `miner.production.json`, `.github/workflows/release.yml` and this file are the
   miner's own;
 - `node/src/lib.rs` declares the two modules, and `node/src/main.rs` runs the daemon
-  with `payout::mining` instead of the defaults: a line each;
+  with `payout::mining` instead of the defaults: a line each. `main.rs` also has
+  `ting miner payout` and the payout account in `ting miner status`, a few lines
+  calling `payout.rs`;
+- `README.md` starts with the miner's own part, above Ting's title, which a merge
+  leaves alone unless Ting changes that title;
 - `node/Cargo.toml` adds wgpu and pollster under the `gpu` feature, and
   `Cargo.lock` their crates;
 - `src/vm/runtime.rs` gives the block candidate two read-only accessors, `producer`

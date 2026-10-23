@@ -345,6 +345,24 @@ pub fn producer_data(account: &Hash) -> Vec<u8> {
     data.extend(account);
     data
 }
+/// The producer data, in hex, paying `account`: 64 hex digits, as a wallet such
+/// as Ting ID shows an account, in either case (`ting miner payout`).
+pub fn payout_producer(account: &str) -> Result<String> {
+    let account = crate::hash_arg(&account.to_ascii_lowercase()).map_err(|_| {
+        format!("{account:?} is not an account: an account is 32 bytes, 64 hex digits")
+    })?;
+    Ok(hex(&producer_data(&account)))
+}
+/// `answer` with `payout`, the payout account its `producer_hex` names, or null
+/// where it names none (`ting miner payout` and `ting miner status`).
+pub fn with_payout(mut answer: Value) -> Value {
+    let producer = answer["producer_hex"]
+        .as_str()
+        .and_then(|p| crate::unhex(p, crate::config::PRODUCER_MAX).ok())
+        .unwrap_or_default();
+    answer["payout"] = json!(payout_account(&producer).map(|account| hex(&account)));
+    answer
+}
 /// A transaction's share of the block: its largest fraction of any capacity.
 fn share(used: &Resources, limits: &Resources) -> f64 {
     (0..4)

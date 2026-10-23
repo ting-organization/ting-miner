@@ -410,3 +410,98 @@ fn a_full_pool_lets_the_lowest_payment_give_way() {
         json!([&first[2], &first[1], &fifteen].map(|tx| hex(&tx.id(chain_id))))
     );
 }
+
+#[test]
+fn an_account_as_a_wallet_shows_it_becomes_producer_data_paying_it() {
+    let account = "0123456789ABCDEF".repeat(4);
+    let producer = payout::payout_producer(&account).unwrap();
+    assert_eq!(
+        producer,
+        format!("4f4350310100000020000000{}", account.to_lowercase())
+    );
+    assert_eq!(
+        payout::with_payout(json!({"producer_hex":producer}))["payout"],
+        json!(account.to_lowercase())
+    );
+    // Only 32 bytes of hex: not part of one, more, or producer data itself.
+    for wrong in [
+        "",
+        &account[..62],
+        &format!("{account}00"),
+        &account.replace('F', "g"),
+        &producer,
+    ] {
+        let refused = payout::payout_producer(wrong).unwrap_err();
+        assert!(refused.contains("64 hex digits"), "{wrong}: {refused}");
+    }
+    for none in ["", "4f435031", "6d696e6572"] {
+        assert_eq!(
+            payout::with_payout(json!({"producer_hex":none}))["payout"],
+            json!(null)
+        );
+    }
+}
+
+fn ting(dir: &Directory, args: &[&str]) -> std::process::Output {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_ting"));
+    command.arg("--data-dir").arg(&dir.0).args(args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    command.output().unwrap()
+}
+fn answer(dir: &Directory, args: &[&str]) -> serde_json::Value {
+    let output = ting(dir, args);
+    assert!(
+        output.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+/// Stops the node of a test that started one, however the test ends.
+struct Stop<'a>(&'a Directory);
+impl Drop for Stop<'_> {
+    fn drop(&mut self) {
+        let _ = ting(self.0, &["stop"]);
+    }
+}
+
+/// `ting miner payout` sets the payout account with the node stopped or running,
+/// and it and `ting miner status` show it; anything but an account is refused and
+/// leaves the producer data as it was.
+#[test]
+fn the_payout_command_sets_the_account_the_blocks_pay_and_shows_it() {
+    let dir = Directory::new();
+    dir.config(false, "payout");
+    let (first, second) = ("0123456789ABCDEF".repeat(4), "fe".repeat(32));
+    let paying = |account: &str| format!("4f4350310100000020000000{account}");
+
+    let set = answer(&dir, &["miner", "payout", &first]);
+    assert_eq!(set["payout"], json!(first.to_lowercase()));
+    let producer = config::Config::load(&dir.0).unwrap().producer();
+    assert_eq!(hex(&producer), paying(&first.to_lowercase()));
+    let refused = ting(&dir, &["miner", "payout", &first[..62]]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("64 hex digits"));
+    assert_eq!(
+        answer(&dir, &["miner", "payout"])["payout"],
+        json!(first.to_lowercase())
+    );
+
+    answer(&dir, &["start"]);
+    let _stop = Stop(&dir);
+    assert_eq!(
+        answer(&dir, &["miner", "payout", &second])["payout"],
+        json!(second)
+    );
+    let status = answer(&dir, &["miner", "status"]);
+    assert_eq!(status["payout"], json!(second));
+    assert_eq!(status["producer_hex"], json!(paying(&second)));
+    // Producer data naming no payout account pays nobody.
+    answer(&dir, &["miner", "producer", "4f435031"]);
+    assert_eq!(answer(&dir, &["miner", "status"])["payout"], json!(null));
+    assert_eq!(answer(&dir, &["miner", "payout"])["payout"], json!(null));
+}
