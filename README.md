@@ -1,3 +1,38 @@
+# Ting miner
+
+The Ting node with a mining policy for pay. It runs, synchronizes and validates
+exactly as [Ting](https://github.com/ting-organization/ting)'s node does, described
+below, and mines with the fastest search the machine has, on its CPU, its GPUs or
+both: it claims each block's reward and takes first the transactions that pay it
+most. [MINER.md](MINER.md) describes what it adds.
+
+## Start mining
+
+1. **An account for the rewards.** In [Ting ID](https://github.com/ting-organization/ting-id),
+   the wallet for Android, Receive shows your Spending account: 64 hex digits.
+2. **The miner.** Download the archive for your machine from the
+   [releases](https://github.com/ting-organization/ting-miner/releases) and unpack
+   it; [download a release](MINER.md#download-a-release) says how to check it.
+3. **Mine.** In the unpacked folder:
+
+   ```sh
+   ./ting init
+   ./ting miner payout <your Spending account>
+   ./ting miner start --threads 4
+   ./ting start
+   ```
+
+`ting init` creates the node in `~/.ting` (`%USERPROFILE%\.ting` on Windows), with a
+`miner.json` that mines Daler (DLR). `ting miner payout` answers with the account the
+blocks will pay: check it against the wallet's. `--threads` is how many of the CPU's
+threads the miner may use. The node then joins the production network and catches up
+with it, which the miner waits for, and mines Daler, each block's reward going to
+your account. `./ting miner status` shows the account, the search in use and how
+fast it hashes; `./ting stop` stops the node, and `./ting start` mines again. On
+Windows the command is `.\ting.exe`.
+
+---
+
 # Ting
 
 Ting is a general-purpose proof-of-work blockchain built as a permanent

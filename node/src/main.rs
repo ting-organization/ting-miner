@@ -10,7 +10,7 @@ use std::{
 use ting_node::{
     Result,
     config::{self, Config, Running},
-    daemon, transport,
+    daemon, payout, transport,
 };
 
 #[derive(Parser)]
@@ -131,6 +131,11 @@ enum MinerCommand {
     /// Set the producer data of the blocks this node builds (hex), or clear it.
     Producer {
         hex: Option<String>,
+    },
+    /// Pay the blocks this node builds to ACCOUNT, 64 hex digits as a wallet
+    /// shows it, or show the account they pay.
+    Payout {
+        account: Option<String>,
     },
     /// Set the capacity votes of the blocks this node builds: compute, state
     /// access, data and growth, each hold, increase or decrease.
@@ -376,6 +381,9 @@ async fn execute(cli: Cli) -> Result<Option<Value>> {
                 ..Default::default()
             };
             let g = config::initialize_with(dir, &c, g)?;
+            if public {
+                payout::initialize(dir)?;
+            }
             json!({"initialized":dir,"chain_id":ting_core::hash::hex(&g.chain_id()),"api_enabled":api})
         }
         Action::Run => {
@@ -413,7 +421,7 @@ async fn execute(cli: Cli) -> Result<Option<Value>> {
         }
         Action::Miner(MinerCommand::Stop) => edit(dir, "miner", json!({"action":"stop"})).await?,
         Action::Miner(MinerCommand::Status) => {
-            rpc(dir, "miner", json!({"action":"status"})).await?
+            payout::with_payout(rpc(dir, "miner", json!({"action":"status"})).await?)
         }
         Action::Miner(MinerCommand::Votes { votes }) => {
             let votes: Vec<u8> = votes
@@ -434,6 +442,22 @@ async fn execute(cli: Cli) -> Result<Option<Value>> {
                 json!({"action":"producer","producer":hex.unwrap_or_default()}),
             )
             .await?
+        }
+        Action::Miner(MinerCommand::Payout { account }) => {
+            let producer = match account {
+                Some(account) => {
+                    let producer = payout::payout_producer(&account)?;
+                    edit(
+                        dir,
+                        "miner",
+                        json!({"action":"producer","producer":producer}),
+                    )
+                    .await?;
+                    producer
+                }
+                None => ting_core::hash::hex(&Config::load(dir)?.producer()),
+            };
+            payout::with_payout(json!({"producer_hex":producer}))
         }
         Action::Template { transactions } => {
             let params = if transactions.is_empty() {
