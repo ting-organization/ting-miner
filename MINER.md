@@ -87,6 +87,55 @@ faster. One limit stays Ting's: its miner loop asks a search for 2^30 nonces at 
 time and then builds a new template, so past some tens of GH/s, a handful of fast
 GPUs, building templates starts to take a share of the time.
 
+## Download a release
+
+Each [release](https://github.com/ting-organization/ting-miner/releases) carries the
+`ting` binary for five platforms, built by `.github/workflows/release.yml`:
+
+| Platform | Archive |
+|---|---|
+| Mac, Apple silicon | `ting-miner-<tag>-aarch64-apple-darwin.tar.gz` |
+| Mac, Intel | `ting-miner-<tag>-x86_64-apple-darwin.tar.gz` |
+| Linux, x86_64 | `ting-miner-<tag>-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux, ARM | `ting-miner-<tag>-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows, x86_64 | `ting-miner-<tag>-x86_64-pc-windows-msvc.zip` |
+
+Each holds the binary, this file, `miner.production.json` and the licences. The
+binary is the whole node, the seed blocks, wiki and explorer included, and one build
+mines at full speed on every machine of its platform: as it runs, the CPU search
+finds the SHA-256 instructions the CPU has, and the GPU search the Metal, Vulkan or
+DX12 driver. On Linux it needs glibc 2.35 or later, as in Ubuntu 22.04 and Debian 12.
+
+```sh
+tag=v0.1.0-miner.1
+archive=ting-miner-$tag-x86_64-unknown-linux-gnu.tar.gz
+curl -LO https://github.com/ting-organization/ting-miner/releases/download/$tag/$archive
+curl -LO https://github.com/ting-organization/ting-miner/releases/download/$tag/SHA256SUMS
+shasum -a 256 --check --ignore-missing SHA256SUMS
+tar -xzf $archive
+```
+
+`gh attestation verify $archive --repo ting-organization/ting-miner` checks that
+this repository's release workflow built the archive, and from which commit. On
+Windows, `Get-FileHash` prints an archive's SHA-256 to compare with `SHA256SUMS`, and
+`Expand-Archive` unpacks it.
+
+The binaries are not signed. A Mac refuses to run one downloaded in a browser until
+`xattr -d com.apple.quarantine ting` clears the browser's mark; one downloaded with
+`curl` has none. Windows SmartScreen asks before running it the first time.
+
+A release is a tag `v<version>-miner.<n>`, the version being `node/Cargo.toml`'s,
+which is Ting's and which the miner leaves as it is; `ting --version` prints it. The
+tag starts the release workflow, which makes a draft release of the five, and CI,
+which tests the same commit; the draft is published once CI passes. On a pull request
+that changes the workflow, or run by hand from the Actions tab, it builds the five
+without a release.
+
+```sh
+git tag v0.1.0-miner.1
+git push origin v0.1.0-miner.1
+```
+
 ## Configure
 
 `miner.json` in the node's data directory, read when the node starts:
@@ -145,7 +194,8 @@ git merge upstream/master
 The miner changes as little of Ting as it can, so merges stay clean:
 
 - `node/src/payout.rs`, `node/src/search.rs`, their tests in `node/tests/`,
-  `miner.production.json` and this file are the miner's own;
+  `miner.production.json`, `.github/workflows/release.yml` and this file are the
+  miner's own;
 - `node/src/lib.rs` declares the two modules, and `node/src/main.rs` runs the daemon
   with `payout::mining` instead of the defaults: a line each;
 - `node/Cargo.toml` adds wgpu and pollster under the `gpu` feature, and
