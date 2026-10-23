@@ -69,11 +69,15 @@ jobs:
     steps:
       - name: Rust and a linker in the container
         if: matrix.container
+        # A download that fails once would fail the release, so each is retried.
         run: |
-          apt-get update
-          apt-get install --yes --no-install-recommends ca-certificates curl gcc git libc6-dev
-          curl --proto '=https' --tlsv1.2 --silent --show-error --fail https://sh.rustup.rs |
-            sh -s -- -y --profile minimal --default-toolchain none
+          apt-get -o Acquire::Retries=5 update
+          apt-get -o Acquire::Retries=5 install --yes --no-install-recommends ca-certificates curl gcc git libc6-dev
+          curl --proto '=https' --tlsv1.2 --silent --show-error --fail \
+            --retry 5 --retry-delay 10 --retry-all-errors --output /tmp/rustup-init \
+            "https://static.rust-lang.org/rustup/dist/$TARGET/rustup-init"
+          chmod +x /tmp/rustup-init
+          /tmp/rustup-init -y --profile minimal --default-toolchain none
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Pinned Rust toolchain
