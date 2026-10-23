@@ -505,3 +505,30 @@ fn the_payout_command_sets_the_account_the_blocks_pay_and_shows_it() {
     assert_eq!(answer(&dir, &["miner", "status"])["payout"], json!(null));
     assert_eq!(answer(&dir, &["miner", "payout"])["payout"], json!(null));
 }
+
+/// `ting init` gives a production node the production policy, claiming and
+/// valuing Daler, and a node of another network none; a policy already there is
+/// kept.
+#[test]
+fn a_new_production_node_mines_daler_and_another_network_nothing() {
+    let daler = "305378d17f6af84a563d0f8a8455084948aff7330b62b4f2f98a44b82ba113c4";
+    let production = Directory::new();
+    answer(&production, &["init"]);
+    let written = std::fs::read_to_string(production.0.join("miner.json")).unwrap();
+    assert_eq!(written, payout::PRODUCTION_POLICY);
+    let policy = Policy::load(&production.0).unwrap();
+    assert_eq!(policy.claims, [daler]);
+    assert_eq!(policy.assets, [(daler.to_owned(), 1.0)].into());
+    assert!(policy.unpaid);
+
+    let development = Directory::new();
+    answer(&development, &["init", "--dev"]);
+    assert!(!development.0.join("miner.json").exists());
+    assert!(Policy::load(&development.0).unwrap().claims.is_empty());
+
+    let own = r#"{"assets":{},"claims":[]}"#;
+    std::fs::write(production.0.join("miner.json"), own).unwrap();
+    payout::initialize(&production.0).unwrap();
+    let kept = std::fs::read_to_string(production.0.join("miner.json")).unwrap();
+    assert_eq!(kept, own);
+}

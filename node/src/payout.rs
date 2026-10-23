@@ -16,6 +16,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    fs::OpenOptions,
+    io::{ErrorKind, Write},
     net::IpAddr,
     path::Path,
 };
@@ -81,6 +83,29 @@ impl Policy {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(format!("cannot read {POLICY_FILE}: {e}")),
         }
+    }
+}
+/// `miner.production.json`, the policy of a miner on the production network:
+/// it claims and values Daler.
+pub const PRODUCTION_POLICY: &str = include_str!("../../miner.production.json");
+/// Gives `dir`, a new data directory of the production network, the production
+/// policy as its `miner.json`, unless it has one (`ting init`). A ContractId
+/// belongs to one chain, so a node of another network starts without one.
+pub fn initialize(dir: &Path) -> Result<()> {
+    let path = dir.join(POLICY_FILE);
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            file.write_all(PRODUCTION_POLICY.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|e| format!("cannot write {POLICY_FILE}: {e}"))?;
+            eprintln!(
+                "wrote {}: the production policy, mining Daler",
+                path.display()
+            );
+            Ok(())
+        }
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(format!("cannot write {POLICY_FILE}: {e}")),
     }
 }
 

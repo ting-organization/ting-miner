@@ -381,6 +381,9 @@ async fn execute(cli: Cli) -> Result<Option<Value>> {
                 ..Default::default()
             };
             let g = config::initialize_with(dir, &c, g)?;
+            if public {
+                payout::initialize(dir)?;
+            }
             json!({"initialized":dir,"chain_id":ting_core::hash::hex(&g.chain_id()),"api_enabled":api})
         }
         Action::Run => {

@@ -101,7 +101,7 @@ Each [release](https://github.com/ting-organization/ting-miner/releases) carries
 | Windows, x86_64 | `ting-miner-<tag>-x86_64-pc-windows-msvc.zip` |
 
 Each holds the binary, `README.md`, whose [start mining](README.md#start-mining) takes
-it from there, this file, `miner.production.json` and the licences. The
+it from there, this file and the licences. The
 binary is the whole node, the seed blocks, wiki and explorer included, and one build
 mines at full speed on every machine of its platform: as it runs, the CPU search
 finds the SHA-256 instructions the CPU has, and the GPU search the Metal, Vulkan or
@@ -139,7 +139,9 @@ git push origin v0.1.0-miner.1
 
 ## Configure
 
-`miner.json` in the node's data directory, read when the node starts:
+`miner.json` in the node's data directory, read when the node starts; `ting init`
+writes [the production network's](#the-production-network) into a new production
+node:
 
 ```json
 {
@@ -181,12 +183,9 @@ nobody, and claim nothing.
 `miner.production.json` mines Daler (DLR), the coin of ContractId
 `305378d17f6af84a563d0f8a8455084948aff7330b62b4f2f98a44b82ba113c4`, deployed at
 height 443 of the production network: it claims Daler's block reward and values
-payments in it. A ContractId belongs to one chain, so the file is for the production
-network only.
-
-```sh
-cp miner.production.json ~/.ting/miner.json
-```
+payments in it. The binary carries it, and `ting init` writes it as `miner.json` into
+a new production node unless one is there. A ContractId belongs to one chain, so
+`ting init --dev` and `--genesis` write none, and a node made before keeps its own.
 
 ## Keep in step with Ting
 
@@ -202,8 +201,8 @@ The miner changes as little of Ting as it can, so merges stay clean:
   miner's own;
 - `node/src/lib.rs` declares the two modules, and `node/src/main.rs` runs the daemon
   with `payout::mining` instead of the defaults: a line each. `main.rs` also has
-  `ting miner payout` and the payout account in `ting miner status`, a few lines
-  calling `payout.rs`;
+  `ting miner payout`, the payout account in `ting miner status` and the production
+  policy `ting init` writes, a few lines calling `payout.rs`;
 - `README.md` starts with the miner's own part, above Ting's title, which a merge
   leaves alone unless Ting changes that title;
 - `node/Cargo.toml` adds wgpu and pollster under the `gpu` feature, and

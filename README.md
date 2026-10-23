@@ -17,19 +17,19 @@ most. [MINER.md](MINER.md) describes what it adds.
 
    ```sh
    ./ting init
-   cp miner.production.json ~/.ting/miner.json
    ./ting miner payout <your Spending account>
    ./ting miner start --threads 4
    ./ting start
    ```
 
-`ting miner payout` answers with the account the blocks will pay: check it against
-the wallet's. `--threads` is how many of the CPU's threads the miner may use. The
-node then joins the production network and catches up with it, which the miner waits
-for, and mines Daler (DLR), each block's reward going to your account.
-`./ting miner status` shows the account, the search in use and how fast it hashes;
-`./ting stop` stops the node, and `./ting start` mines again. On Windows the command
-is `.\ting.exe` and the data directory `%USERPROFILE%\.ting`.
+`ting init` creates the node in `~/.ting` (`%USERPROFILE%\.ting` on Windows), with a
+`miner.json` that mines Daler (DLR). `ting miner payout` answers with the account the
+blocks will pay: check it against the wallet's. `--threads` is how many of the CPU's
+threads the miner may use. The node then joins the production network and catches up
+with it, which the miner waits for, and mines Daler, each block's reward going to
+your account. `./ting miner status` shows the account, the search in use and how
+fast it hashes; `./ting stop` stops the node, and `./ting start` mines again. On
+Windows the command is `.\ting.exe`.
 
 ---
 
