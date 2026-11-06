@@ -90,6 +90,76 @@ fn gpus() -> Option<Arc<dyn Search>> {
     }
 }
 
+/// A search as `ting status` and `ting miner status` show it, from what its
+/// `describe` says: `None` for the CPU searches, which Ting's text shows by
+/// their threads.
+pub fn text(described: &Value) -> Option<String> {
+    match described["kind"].as_str()? {
+        "auto" => {
+            let rates = described["mhs"].as_object();
+            let others: Vec<String> = rates
+                .into_iter()
+                .flatten()
+                .filter(|(name, _)| described["using"] != name.as_str())
+                .map(|(name, mhs)| format!("{name} {}", speed(mhs)))
+                .collect();
+            Some(match described["using"].as_str() {
+                Some(using) => format!(
+                    "auto, using {using} at {} (of {})",
+                    speed(&described["mhs"][using]),
+                    others.join(", ")
+                ),
+                None => "auto, timing the searches it chooses from".to_owned(),
+            })
+        }
+        "split" => Some(
+            described["parts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|part| {
+                    let share = part["share"].as_f64().unwrap_or(0.0) * 100.0;
+                    format!("{} {share:.0}%", name(&part["search"]))
+                })
+                .collect::<Vec<_>>()
+                .join(" + "),
+        ),
+        "gpu" => Some(name(described)),
+        _ => None,
+    }
+}
+/// One search's name in [`text`]: a GPU by its adapter, a CPU search by its
+/// threads.
+fn name(described: &Value) -> String {
+    match described["kind"].as_str() {
+        Some("gpu") => {
+            let adapter = described["adapter"].as_str().unwrap_or("GPU");
+            if described["failed"] == true {
+                format!("{adapter} (failed)")
+            } else {
+                adapter.to_owned()
+            }
+        }
+        Some("cpu") => match described["threads"].as_u64() {
+            Some(1) => "1 CPU thread".to_owned(),
+            Some(threads) => format!("{threads} CPU threads"),
+            None => "CPU".to_owned(),
+        },
+        _ => text(described).unwrap_or_else(|| "search".to_owned()),
+    }
+}
+/// A rate in MH/s, as `auto` times it, in the unit that reads best.
+fn speed(mhs: &Value) -> String {
+    let mhs = mhs.as_f64().unwrap_or(0.0);
+    if mhs >= 1000.0 {
+        format!("{:.2} GH/s", mhs / 1000.0)
+    } else if mhs >= 10.0 {
+        format!("{mhs:.0} MH/s")
+    } else {
+        format!("{mhs:.1} MH/s")
+    }
+}
+
 /// How far one call may search. The built-in miner moves its start on by 64
 /// times `attempts` after each call (`mining::Miner`), so a call may cover that
 /// many nonces without trying any twice. The CPU searches `attempts` on each

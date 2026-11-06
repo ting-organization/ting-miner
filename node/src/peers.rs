@@ -4,8 +4,9 @@
 //! it asks for the peer's new headers and the blocks it lacks, pushes its own
 //! new blocks when it has more work, and exchanges pooled transactions. `run`
 //! keeps the connections: it opens them, opens them again after a failure,
-//! bans a peer that sent invalid data, and connects one more peer while the
-//! tip has not moved for a while.
+//! bans a peer that sent invalid data, ends its links to seeds once it has
+//! enough other peers, and connects one more peer while the tip has not moved
+//! for a while.
 use crate::{
     FRAME_MAX, Result,
     chain::{
@@ -15,7 +16,7 @@ use crate::{
     },
     config,
     daemon::Node,
-    discovery::{self, BAN},
+    discovery::{self, AddressBook, BAN},
     hash_arg,
     transport::{self, ITSELF},
     wire::{self, Answer, Body, Part, Request},
@@ -23,7 +24,7 @@ use crate::{
 use num_bigint::BigUint;
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque, btree_map},
     net::SocketAddr,
     sync::{
         Arc,
@@ -36,8 +37,8 @@ use ting_core::{
     protocol::{HEADER_LEN, Header},
 };
 use tokio::{
-    net::tcp::OwnedWriteHalf,
-    sync::mpsc,
+    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
     task::{AbortHandle, JoinSet},
     time::Instant,
 };
@@ -65,6 +66,15 @@ const LOOKING: Duration = Duration::from_secs(10);
 /// Rounds of one connection start at least this far apart, whatever the peer
 /// announces.
 const ROUND_GAP: Duration = Duration::from_millis(100);
+/// One connection exchanges pooled and deferred transactions at most once in
+/// this long, and up to `SWAP_JITTER` more at random, so that a node's
+/// connections do not list pools in step: each exchange lists the peer's pool
+/// and deferred set, up to five pages of 32 KiB, while pools may change many
+/// times a second. A change after a quiet while is exchanged at once, so a new
+/// transaction waits at most about three seconds a connection, as Bitcoin
+/// announces transactions to an outbound peer about every two.
+const SWAP_GAP: Duration = Duration::from_secs(2);
+const SWAP_JITTER: Duration = Duration::from_secs(1);
 /// Addresses are asked of each peer this often while the node has the
 /// connections it wants.
 const ASK_INTERVAL: u64 = 600;
@@ -74,13 +84,49 @@ const PROBE_INTERVAL: u64 = 120;
 /// connected until it moves.
 const STALE_TIP: u64 = 600;
 
+/// The most bytes of frames a connection holds ahead of handling them
+/// (wiki: reference/peer-protocol#limits): what its eight places for frames
+/// hold of the largest answers a syncing node asks for, a slice and its
+/// framing each, as before. A frame larger than the room left, such as a
+/// launch-era node's `pending` answer of up to 8 MiB, is read whole and waits
+/// until the frames before it are handled, so a peer sending frames of 16 MiB
+/// has one held and one waiting at a time, not eight: a connection reads at
+/// most this room, or one larger frame, and one frame more ahead.
+const QUEUED_MAX: usize = 8 * (SLICE_MAX + 1024);
+/// A frame read and not yet handled, with its share of `QUEUED_MAX`.
+type Queued = (Result<wire::Frame>, OwnedSemaphorePermit);
+/// Reads frames from `read` as they come, each once `room` has its size, or
+/// all of it for a larger one; a frame gives its share back as it is taken.
+fn reading(
+    mut read: OwnedReadHalf,
+    room: Arc<Semaphore>,
+) -> (tokio::task::JoinHandle<()>, mpsc::Receiver<Queued>) {
+    let (sender, frames) = mpsc::channel(8);
+    let reader = tokio::spawn(async move {
+        loop {
+            let frame = transport::read_wire_sized(&mut read, None, FRAME_MAX).await;
+            let end = frame.is_err();
+            let size = frame.as_ref().map_or(0, |(_, size)| *size).min(QUEUED_MAX);
+            let share = room
+                .clone()
+                .acquire_many_owned(u32::try_from(size).expect("QUEUED_MAX fits"))
+                .await
+                .expect("never closed");
+            let frame = frame.map(|(frame, _)| frame);
+            if sender.send((frame, share)).await.is_err() || end {
+                break;
+            }
+        }
+    });
+    (reader, frames)
+}
 /// One outbound connection's transport: requests go out, one at a time or
 /// several before their answers, and frames come back through a reader task,
 /// so that the announcements a peer sends between answers are noticed while
 /// the connection is idle.
 struct Conn {
     writer: OwnedWriteHalf,
-    frames: mpsc::Receiver<Result<wire::Frame>>,
+    frames: mpsc::Receiver<Queued>,
     reader: tokio::task::JoinHandle<()>,
     /// The peer's latest announcement not yet acted on.
     news: Option<wire::Announcement>,
@@ -118,17 +164,8 @@ impl Conn {
         if remote.nonce == node.nonce {
             return Err(ITSELF.into());
         }
-        let (mut read, writer) = stream.into_split();
-        let (sender, frames) = mpsc::channel(8);
-        let reader = tokio::spawn(async move {
-            loop {
-                let frame = transport::read_wire(&mut read, None, FRAME_MAX).await;
-                let end = frame.is_err();
-                if sender.send(frame).await.is_err() || end {
-                    break;
-                }
-            }
-        });
+        let (read, writer) = stream.into_split();
+        let (reader, frames) = reading(read, Arc::new(Semaphore::new(QUEUED_MAX)));
         let conn = Self {
             writer,
             frames,
@@ -176,7 +213,8 @@ impl Conn {
             let frame = tokio::time::timeout_at(deadline, self.frames.recv())
                 .await
                 .map_err(|_| "reply deadline exceeded")?
-                .ok_or("connection closed")??;
+                .ok_or("connection closed")?
+                .0?;
             match frame {
                 wire::Frame::Announcement(news) => self.news = Some(news),
                 wire::Frame::Answer(answer) => return Ok(Ok(answer)),
@@ -187,7 +225,7 @@ impl Conn {
     }
     /// Waits for the peer's next announcement.
     async fn announced(&mut self) -> Result<()> {
-        match self.frames.recv().await.ok_or("connection closed")?? {
+        match self.frames.recv().await.ok_or("connection closed")?.0? {
             wire::Frame::Announcement(news) => {
                 self.news = Some(news);
                 Ok(())
@@ -222,6 +260,9 @@ struct Link {
     /// The peer's tip, height, work and pool sizes, as it last told them.
     tip: Hash,
     height: u64,
+    /// The peer's tip and its height once this node holds that header: what
+    /// the peer claims, checked.
+    checked: Option<(Hash, u64)>,
     work: BigUint,
     pool: (u64, u64),
     /// Where the next header page starts while a peer's chain spans rounds.
@@ -233,6 +274,8 @@ struct Link {
     /// while it is on this node's branch.
     pushed: Option<Hash>,
     swap: bool,
+    /// When the next exchange of transactions may start.
+    swap_due: Instant,
     /// The exchange of pooled and of deferred transactions with the peer.
     relay: [Relay; 2],
     /// The tip at which transactions refused for want of room were last
@@ -240,8 +283,15 @@ struct Link {
     retried: Option<Hash>,
     asked: u64,
     marked: u64,
+    /// When the peer last delivered a block or completed a round.
+    succeeded: Option<u64>,
     connected: u64,
     delivered: Option<u64>,
+    /// Whether the peer claimed more than it holds since it last delivered a
+    /// block: at a tip as high as the best header, it lacked a block it was
+    /// asked for, or it could not show the headers to the tip it announced.
+    /// Such a peer cannot serve this node (wiki: node/sync#finding-more-peers).
+    lacking: bool,
 }
 /// A block on its way from a peer: the bytes so far, its most bytes, when it
 /// was asked for and by when it must be complete.
@@ -300,22 +350,8 @@ impl Link {
     }
     /// Does what is due; returns whether more is waiting at once.
     async fn round(&mut self, local: &Event) -> Result<bool> {
-        let mut more = false;
-        if self.pull {
-            self.pull = false;
-            more |= self.headers().await?;
-        }
-        if self.fetch {
-            self.blocks().await?;
-        }
-        if self.push {
-            self.push = false;
-            more |= self.push_blocks(local).await?;
-        }
-        if self.swap {
-            self.swap = false;
-            self.swap_pool(local).await?;
-        }
+        // Addresses come first: a node that knows only a seed learns of
+        // other peers before its first blocks, which can take long.
         let interval = if self.looking.load(Ordering::Relaxed) {
             LOOKING.as_secs()
         } else {
@@ -324,6 +360,25 @@ impl Link {
         if self.node.discovery && crate::now() >= self.asked + interval {
             self.asked = crate::now();
             self.addresses().await;
+        }
+        let mut more = false;
+        if self.pull {
+            self.pull = false;
+            more |= self.headers().await?;
+        }
+        self.check_tip().await?;
+        if self.fetch {
+            self.blocks().await?;
+        }
+        if self.push {
+            self.push = false;
+            more |= self.push_blocks(local).await?;
+        }
+        if self.swap && Instant::now() >= self.swap_due {
+            self.swap = false;
+            self.swap_pool(local).await?;
+            let jitter = SWAP_JITTER * (discovery::seed() % 1_000) as u32 / 1_000;
+            self.swap_due = Instant::now() + SWAP_GAP + jitter;
         }
         if let Some(error) = &self.conn.broken {
             return Err(error.clone());
@@ -337,10 +392,11 @@ impl Link {
     async fn headers(&mut self) -> Result<bool> {
         let handle = self.node.handle.clone();
         for _ in 0..PAGES {
-            let locator = match self.next {
-                Some(next) => vec![next],
-                None => state(&self.node).await?.locator,
+            let (locator, own) = match self.next {
+                Some(next) => (vec![next], false),
+                None => (state(&self.node).await?.locator, true),
             };
+            let unlisted = own && !locator.contains(&self.tip);
             let page = match self.conn.request(Request::Headers { locator }).await {
                 Ok(Answer::Headers(page)) => page,
                 Ok(_) => return Err(unexpected("headers")),
@@ -354,6 +410,14 @@ impl Link {
             };
             if page.is_empty() {
                 self.next = None;
+                // Nothing past this node's own locator: the peer's tip is
+                // one of its entries, so an announced tip that is none of
+                // them, and that this node does not hold, is one the peer
+                // cannot show.
+                if unlisted {
+                    self.check_tip().await?;
+                    self.lacking |= self.checked.is_none();
+                }
                 return Ok(false);
             }
             let full = page.len() == HEADERS_PAGE;
@@ -386,6 +450,21 @@ impl Link {
         self.pull = true;
         Ok(true)
     }
+    /// Whether this node holds the peer's tip, a header it has not found
+    /// invalid, and at what height, asked again once the tip moves or until
+    /// the node holds it.
+    async fn check_tip(&mut self) -> Result<()> {
+        if self.checked.is_some_and(|(tip, _)| tip == self.tip) {
+            return Ok(());
+        }
+        let held = self
+            .node
+            .handle
+            .call("header_height", json!({"id":hex(&self.tip)}))
+            .await?;
+        self.checked = held["height"].as_u64().map(|height| (self.tip, height));
+        Ok(())
+    }
     /// Blocks along the best header's branch, as many as the chain asks of
     /// this peer; other connections fetch others at the same time. Their
     /// requests go out together and are kept topped up, so that the peer is
@@ -397,6 +476,10 @@ impl Link {
             // this one again once it announces a new tip.
             Ok(Some(Stop::Missing)) => {
                 self.fetch = false;
+                // The blocks asked for lead to the best header: a peer whose
+                // tip is as high claimed more than it holds.
+                let best = handle.events().borrow().best;
+                self.lacking |= self.checked.is_some_and(|(_, height)| height >= best);
                 handle.call("release", json!({"peer":self.peer})).await?;
                 Ok(())
             }
@@ -576,6 +659,10 @@ impl Link {
                 Ok(imported) => {
                     if imported["known"] == false {
                         self.delivered = Some(crate::now());
+                        self.lacking = false;
+                        // A first download can take a round of hours: the
+                        // peer shows as delivering all along.
+                        self.report();
                     }
                     // What the chain asks of this peer moves on with it.
                     more = true;
@@ -983,18 +1070,27 @@ impl Link {
             .book
             .lock()
             .unwrap()
-            .learn_shared(&shared, self.address.ip());
+            .learn_shared(&shared, self.address.ip(), crate::now());
     }
-    /// A completed round: the peer is proven, and its status current.
+    /// A block delivered or a round completed: the peer is proven, and its
+    /// status current.
     fn report(&mut self) {
         let now = crate::now();
         if now >= self.marked + 60 {
             self.marked = now;
             self.node.book.lock().unwrap().succeeded(self.address, now);
         }
+        self.succeeded = Some(now);
+        self.publish();
+    }
+    /// The peer's status, as `ting peers` shows it. A hello alone publishes
+    /// it without proving the peer: one that answers and then fails still
+    /// backs off as any failed peer does (wiki: node/sync#finding-more-peers).
+    fn publish(&self) {
         let status = json!({"address":self.address,"source":self.source,"agent":self.agent,
-            "connected":self.connected,"last_success":now,"height":self.height,
-            "last_block":self.delivered,"error":null});
+            "connected":self.connected,"last_success":self.succeeded,"height":self.height,
+            "checked_height":self.checked.map(|(_, height)| height),
+            "last_block":self.delivered,"lacking":self.lacking,"error":null});
         self.node
             .peers
             .lock()
@@ -1024,6 +1120,7 @@ async fn follow(
         agent: hello.agent,
         tip: hello.tip,
         height: hello.height,
+        checked: None,
         work: hello.work,
         pool: (0, 0),
         next: None,
@@ -1032,13 +1129,22 @@ async fn follow(
         push: true,
         pushed: None,
         swap: true,
+        swap_due: Instant::now(),
         relay: Default::default(),
         retried: None,
         asked: 0,
         marked: 0,
+        succeeded: None,
         connected: crate::now(),
         delivered: None,
+        lacking: false,
     };
+    link.publish();
+    crate::log!(
+        "connected to {address}: {}, at height {}",
+        link.agent,
+        link.height
+    );
     let mut last = Instant::now();
     loop {
         tokio::time::sleep_until(last + ROUND_GAP).await;
@@ -1051,6 +1157,8 @@ async fn follow(
             } else {
                 KEEPALIVE
             };
+            // An exchange that waits for its time wakes the connection then.
+            let (swapping, swap_due) = (link.swap, link.swap_due);
             tokio::select! {
                 changed = events.changed() => {
                     if changed.is_err() {
@@ -1063,6 +1171,7 @@ async fn follow(
                     link.fetch = true;
                     link.swap = true;
                 }
+                _ = tokio::time::sleep_until(swap_due), if swapping => {}
                 _ = node.stopped() => return Ok(()),
             }
         }
@@ -1083,23 +1192,27 @@ async fn follow(
 /// A peer sent invalid data: its address range is banned for a day, unless
 /// it holds a configured peer or is this machine (wiki: node/sync). Its
 /// connections end: inbound ones at once, outbound ones at the next check.
-pub fn punish(node: &Node, address: SocketAddr) {
+/// Returns whether it was banned.
+pub fn punish(node: &Node, address: SocketAddr) -> bool {
     let now = crate::now();
     let mut book = node.book.lock().unwrap();
-    if book.ban(address.ip(), now + BAN) {
+    let banned = book.ban(address.ip(), now + BAN);
+    if banned {
         node.inbound
             .lock()
             .unwrap()
             .end(|ip| book.is_banned(ip, now));
     }
+    banned
 }
 
 /// Records how a connection ended, and gives what it was asked to the others.
+/// The end of a connection is written to the log, as is a configured peer's
+/// failure to connect each time its reason changes; discovered addresses are
+/// tried quietly, as many never answer.
 async fn ended(node: &Node, address: SocketAddr, source: &str, result: Result<()>) {
     if let Err(error) = &result {
-        if is_invalid(error) {
-            punish(node, address);
-        }
+        let banned = is_invalid(error) && punish(node, address);
         let mut book = node.book.lock().unwrap();
         let mut peers = node.peers.lock().unwrap();
         let key = address.to_string();
@@ -1111,6 +1224,12 @@ async fn ended(node: &Node, address: SocketAddr, source: &str, result: Result<()
             let mut status = peers
                 .remove(&key)
                 .unwrap_or_else(|| json!({"address":address,"source":source,"last_success":null}));
+            let ban = if banned { "; banned for a day" } else { "" };
+            if status["connected"].is_number() {
+                crate::log!("disconnected from {address}: {error}{ban}");
+            } else if source == "config" && status["error"] != json!(error) {
+                crate::log!("cannot connect to configured peer {address}: {error}{ban}");
+            }
             status["error"] = json!(error);
             status["last_attempt"] = json!(crate::now());
             status["connected"] = Value::Null;
@@ -1124,6 +1243,108 @@ async fn ended(node: &Node, address: SocketAddr, source: &str, result: Result<()
 }
 
 type Ended = (SocketAddr, Result<()>);
+type Links = BTreeMap<SocketAddr, (AbortHandle, &'static str)>;
+
+/// The links of `links` whose tasks have finished, taken out, each with its
+/// source and how it ended. A task that panicked ends as a connection that
+/// failed: its peer no longer shows as connected, and is connected again as
+/// any is after a failure. A link that was aborted was taken out then, even
+/// one whose task had already finished, and its address may have a new link
+/// since: its end is passed over.
+fn finished(
+    tasks: &mut JoinSet<Ended>,
+    links: &mut Links,
+) -> Vec<(SocketAddr, &'static str, Result<()>)> {
+    let mut done = Vec::new();
+    while let Some(joined) = tasks.try_join_next_with_id() {
+        let (id, (address, result)) = match joined {
+            Ok(ended) => ended,
+            Err(error) => match links.iter().find(|(_, (link, _))| link.id() == error.id()) {
+                Some((address, _)) => (
+                    error.id(),
+                    (*address, Err(format!("connection task failed: {error}"))),
+                ),
+                None => continue,
+            },
+        };
+        if let btree_map::Entry::Occupied(link) = links.entry(address)
+            && link.get().0.id() == id
+        {
+            done.push((address, link.remove().1, result));
+        }
+    }
+    done
+}
+
+/// Whether the node does without the seeds (wiki:
+/// node/sync#finding-more-peers), having done so before if `left`, by its
+/// connections `linked` that `peers` shows connected, its tip and best header
+/// in `local`, and whether its tip is `stale`. What a peer claims of its own
+/// height counts for nothing: only the height of its tip once the node holds
+/// that header, whose work it has checked, and only while the peer has not
+/// been caught lacking what it claims. The node leaves the seeds once its own
+/// tip is within a block of its best header, as a node that is not still
+/// downloading is, it holds a seed's tip, and at least half of `max_peers`
+/// others, configured or discovered, are not lacking and at tips at least as
+/// high as its best header: a peer still behind cannot serve it yet. It goes
+/// back to them once fewer than a quarter of `max_peers` others that are not
+/// lacking are connected, or none, so that a peer that drops for a while does
+/// not bring them back; and while its tip is stale, since the peers it has
+/// may not relay blocks.
+fn without_seeds(
+    left: bool,
+    linked: impl IntoIterator<Item = SocketAddr>,
+    book: &AddressBook,
+    peers: &BTreeMap<String, Value>,
+    max_peers: u32,
+    local: &Event,
+    stale: bool,
+) -> bool {
+    if stale {
+        return false;
+    }
+    // Each connected link that is not a seed's and not lacking, by its
+    // peer's checked height; and whether one to a seed has its checked.
+    let mut serving = Vec::new();
+    let mut seeded = false;
+    for a in linked {
+        let Some(status) = peers.get(&a.to_string()) else {
+            continue;
+        };
+        if !status["connected"].is_u64() {
+            continue;
+        }
+        let checked = status["checked_height"].as_u64();
+        if book.is_seed(&a) {
+            seeded |= checked.is_some();
+        } else if status["lacking"] == false {
+            serving.push(checked);
+        }
+    }
+    if left {
+        return serving.len() >= (max_peers as usize / 4).max(1);
+    }
+    let caught_up = serving
+        .iter()
+        .filter(|checked| checked.is_some_and(|height| height >= local.best))
+        .count();
+    let synced = local.best > 0 && local.best <= local.height.saturating_add(1);
+    synced && seeded && caught_up >= (max_peers as usize).div_ceil(2)
+}
+
+/// The discovered peers of the links `(address, source)` that take one of the
+/// `max_peers` slots: a seed takes none, so that a node starts other peers
+/// beside the seeds however few slots it has.
+fn slotted(
+    links: impl IntoIterator<Item = (SocketAddr, &'static str)>,
+    book: &AddressBook,
+) -> Vec<SocketAddr> {
+    links
+        .into_iter()
+        .filter(|(a, source)| *source == "discovered" && !book.is_seed(a))
+        .map(|(a, _)| a)
+        .collect()
+}
 
 /// Keeps the outbound connections, checking every two seconds.
 pub async fn run(node: Node) {
@@ -1137,6 +1358,10 @@ pub async fn run(node: Node) {
     // Addresses that reached this node itself, configured ones included: not
     // connected again in this run.
     let mut itself: BTreeSet<SocketAddr> = BTreeSet::new();
+    // Whether the node has left the seeds, and whether it came back to them
+    // since it last did.
+    let mut left_seeds = false;
+    let mut recalled = false;
     loop {
         // A busy or slow chain thread is waited out, never a reason to stop
         // keeping the connections.
@@ -1162,15 +1387,11 @@ pub async fn run(node: Node) {
             .collect();
         let now = crate::now();
         node.book.lock().unwrap().configure(&config.peers);
-        while let Some(done) = tasks.try_join_next() {
-            if let Ok((address, result)) = done
-                && let Some((_, source)) = links.remove(&address)
-            {
-                if matches!(&result, Err(e) if e == ITSELF) {
-                    itself.insert(address);
-                }
-                ended(&node, address, source, result).await;
+        for (address, source, result) in finished(&mut tasks, &mut links) {
+            if matches!(&result, Err(e) if e == ITSELF) {
+                itself.insert(address);
             }
+            ended(&node, address, source, result).await;
         }
         while let Some(done) = probes.try_join_next() {
             if let Ok((address, result)) = done {
@@ -1199,8 +1420,8 @@ pub async fn run(node: Node) {
             }
         }
         // Connections that should end: to a banned address, to a configured
-        // peer no longer configured, or one discovered peer too many once the
-        // tip moves again.
+        // peer no longer configured, to a seed once the node holds enough
+        // others, or one discovered peer too many once the tip moves again.
         let current = events.borrow().tip;
         if current != tip {
             (tip, tip_since) = (current, now);
@@ -1211,22 +1432,55 @@ pub async fn run(node: Node) {
         } else {
             0
         };
-        let mut ending: Vec<SocketAddr> = {
+        let mut ending: Vec<(SocketAddr, &str)> = {
             let book = node.book.lock().unwrap();
             links
                 .iter()
-                .filter(|(address, (_, source))| {
-                    book.is_banned(address.ip(), now)
-                        || (*source == "config") != configured.contains(address)
+                .filter_map(|(address, (_, source))| {
+                    if book.is_banned(address.ip(), now) {
+                        Some((*address, "banned"))
+                    } else if *source == "config" && !configured.contains(address) {
+                        Some((*address, "no longer configured"))
+                    } else if *source != "config" && configured.contains(address) {
+                        Some((*address, "connecting again as a configured peer"))
+                    } else {
+                        None
+                    }
                 })
-                .map(|(address, _)| *address)
                 .collect()
         };
-        let discovered: Vec<SocketAddr> = links
-            .iter()
-            .filter(|(a, (_, source))| *source == "discovered" && !ending.contains(a))
-            .map(|(a, _)| *a)
-            .collect();
+        // A seed is where a node starts, not a peer to keep: its links to
+        // seeds take none of the `max_peers` slots, and end once the node
+        // holds enough other peers that can serve it, so that the seeds keep
+        // room for nodes that are new.
+        let local = events.borrow().clone();
+        let (seeds, discovered) = {
+            let book = node.book.lock().unwrap();
+            let peers = node.peers.lock().unwrap();
+            let gone = |a: &SocketAddr| ending.iter().any(|(e, _)| e == a);
+            let linked = links.keys().copied().filter(|a| !gone(a));
+            let was = left_seeds;
+            left_seeds = without_seeds(
+                left_seeds,
+                linked,
+                &book,
+                &peers,
+                config.max_peers,
+                &local,
+                stale,
+            );
+            recalled = !left_seeds && (recalled || was);
+            let seeds: Vec<(SocketAddr, &str)> = links
+                .keys()
+                .copied()
+                .filter(|a| left_seeds && book.is_seed(a) && !gone(a))
+                .map(|a| (a, "enough peers besides the seeds"))
+                .collect();
+            let linked = links.iter().filter(|(a, _)| !gone(a));
+            let discovered = slotted(linked.map(|(a, (_, source))| (*a, *source)), &book);
+            (seeds, discovered)
+        };
+        ending.extend(seeds);
         if discovered.len() > want {
             let peers = node.peers.lock().unwrap();
             let last_block = |a: &SocketAddr| {
@@ -1238,10 +1492,16 @@ pub async fn run(node: Node) {
             };
             let mut by_block = discovered.clone();
             by_block.sort_by_key(last_block);
-            ending.extend(by_block.into_iter().take(discovered.len() - want));
+            ending.extend(
+                by_block
+                    .into_iter()
+                    .take(discovered.len() - want)
+                    .map(|a| (a, "enough peers")),
+            );
         }
-        for address in ending {
+        for (address, reason) in ending {
             if let Some((link, _)) = links.remove(&address) {
+                crate::log!("disconnected from {address}: {reason}");
                 link.abort();
                 node.peers.lock().unwrap().remove(&address.to_string());
                 let _ = node
@@ -1268,10 +1528,25 @@ pub async fn run(node: Node) {
                     .chain([own])
                     .chain(itself.iter().copied())
                     .collect();
-                let connected = links.values().filter(|(_, s)| *s == "discovered").count();
-                let missing = want.saturating_sub(connected);
+                let linked = links.iter().map(|(a, (_, source))| (*a, *source));
+                let missing = want.saturating_sub(slotted(linked, &book).len());
                 for address in book.pick(missing, &busy, now, discovery::seed()) {
-                    start.push((address, "discovered"));
+                    // Picked after every other address, a seed comes only
+                    // when nothing else is left to try.
+                    if !(left_seeds && book.is_seed(&address)) {
+                        start.push((address, "discovered"));
+                    }
+                }
+                // Back from its other peers, or with a stale tip, the node
+                // connects the seeds at once, however many others it has:
+                // they are its way back to the network.
+                if !left_seeds && (recalled || stale) {
+                    for seed in book.seeds() {
+                        let picked = start.iter().any(|(a, _)| *a == seed);
+                        if !picked && !busy.contains(&seed) && book.due(&seed, now) {
+                            start.push((seed, "discovered"));
+                        }
+                    }
                 }
                 if missing == 0
                     && probes.is_empty()
@@ -1297,13 +1572,17 @@ pub async fn run(node: Node) {
                 tasks.spawn(async move { (address, follow(node, address, source, looking).await) });
             links.insert(address, (link, source));
         }
-        looking.store(links.len() < config.max_peers as usize, Ordering::Relaxed);
+        let linked = {
+            let book = node.book.lock().unwrap();
+            links.keys().filter(|a| !book.is_seed(a)).count()
+        };
+        looking.store(linked < config.max_peers as usize, Ordering::Relaxed);
         node.peers.lock().unwrap().retain(|a, _| {
             a.parse()
                 .is_ok_and(|a: SocketAddr| configured.contains(&a) || links.contains_key(&a))
         });
         if let Err(e) = node.book.lock().unwrap().save() {
-            eprintln!("peer address book: {e}");
+            crate::log!("peer address book: {e}");
         }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(2)) => {}
@@ -1312,4 +1591,300 @@ pub async fn run(node: Node) {
     }
     tasks.abort_all();
     probes.abort_all();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use discovery::Source;
+
+    #[tokio::test]
+    async fn frames_read_ahead_of_handling_stay_within_their_room() {
+        // A peer sends frames of 15 MiB, as many as it can, and the node
+        // handles none for a while: what it reads ahead stays within the
+        // room, one frame here, however many places the queue has; then every
+        // frame comes through whole, in order.
+        fn items(n: u8, count: usize, size: usize) -> wire::Frame {
+            let item = wire::Item {
+                id: [n; 32],
+                not_before: None,
+                body: wire::Body::Whole(vec![n; size]),
+            };
+            wire::Frame::Answer(Answer::Items(vec![item; count]))
+        }
+        /// A peer at a new address that sends `frames`, and how many it got
+        /// out.
+        async fn peer(
+            frames: Vec<wire::Frame>,
+        ) -> (OwnedReadHalf, Arc<std::sync::atomic::AtomicUsize>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = sent.clone();
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                for frame in frames {
+                    transport::write_wire(&mut stream, &frame).await.unwrap();
+                    counted.fetch_add(1, Ordering::Relaxed);
+                }
+                // Open until the test ends.
+                std::future::pending::<()>().await;
+            });
+            let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            (stream.into_split().0, sent)
+        }
+        let large: Vec<_> = (0..12).map(|n| items(n, 15, SLICE_MAX)).collect();
+        let (read, sent) = peer(large.clone()).await;
+        let room = Arc::new(Semaphore::new(QUEUED_MAX));
+        let (_reader, mut frames) = reading(read, room.clone());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(room.available_permits(), 0);
+        assert!(sent.load(Ordering::Relaxed) < large.len());
+        for frame in &large {
+            let (got, _share) = tokio::time::timeout(Duration::from_secs(10), frames.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&got.unwrap(), frame);
+            assert!(frames.len() <= 1);
+        }
+        // Frames of half a slice queue as before, eight in the queue's places
+        // and a ninth waiting for one, each holding its size of the room.
+        let small: Vec<_> = (0..16).map(|n| items(n, 1, SLICE_MAX / 2)).collect();
+        let size = small[0].encode().len();
+        let (read, _) = peer(small).await;
+        let room = Arc::new(Semaphore::new(QUEUED_MAX));
+        let (_reader, frames) = reading(read, room.clone());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(frames.len(), 8);
+        assert_eq!(room.available_permits(), QUEUED_MAX - 9 * size);
+    }
+
+    #[test]
+    fn a_node_leaves_the_seeds_once_half_its_peers_can_serve_it() {
+        let a = |i: u8| SocketAddr::from(([8, i, 1, 1], 18442));
+        let mut book = AddressBook::default();
+        let seeds = [a(1), a(2)];
+        for seed in seeds {
+            book.learn_seed(seed);
+        }
+        book.configure(&[a(3)]);
+        for i in 4..=8 {
+            book.learn(a(i), Source::Peer);
+        }
+        // Connected peers, each with the height it claims, the height of its
+        // tip if the node holds that header, and whether it was caught
+        // lacking what it claims.
+        let status = |claimed: u64, checked: Option<u64>, lacking: bool| -> Value {
+            json!({"connected":1,"height":claimed,"checked_height":checked,"lacking":lacking})
+        };
+        let connected = |peers: &[(u8, u64, Option<u64>)]| -> BTreeMap<String, Value> {
+            peers
+                .iter()
+                .map(|(i, claimed, checked)| (a(*i).to_string(), status(*claimed, *checked, false)))
+                .collect()
+        };
+        let held = |peers: &[u8], height: u64| {
+            let peers: Vec<_> = peers.iter().map(|i| (*i, height, Some(height))).collect();
+            connected(&peers)
+        };
+        let lacking = |peers: &[u8], height: u64| -> BTreeMap<String, Value> {
+            peers
+                .iter()
+                .map(|i| (a(*i).to_string(), status(height, Some(height), true)))
+                .collect()
+        };
+        // The node's tip and best header, both at `height`.
+        let at = |height: u64| Event {
+            height,
+            best: height,
+            ..Default::default()
+        };
+        let linked: Vec<SocketAddr> = (1..=7).map(a).collect();
+        let leaves = |left: bool, peers: &BTreeMap<String, Value>, local: &Event| {
+            without_seeds(left, linked.clone(), &book, peers, 8, local, false)
+        };
+        // The seeds and two others, a configured one among them, at the
+        // node's best header, 500; two more still at genesis, and one still
+        // connecting: the seeds stay.
+        let mut peers = held(&[1, 2, 3, 4], 500);
+        peers.extend(held(&[5, 6], 0));
+        assert!(!leaves(false, &peers, &at(500)));
+        // Once two more catch up, half of eight can serve the node.
+        peers.extend(held(&[5, 6], 500));
+        assert!(leaves(false, &peers, &at(500)));
+        // A peer that failed is not connected, whatever its status says.
+        let mut failed = peers.clone();
+        failed.insert(
+            a(6).to_string(),
+            json!({"connected":null,"checked_height":500,"lacking":false}),
+        );
+        assert!(!leaves(false, &failed, &at(500)));
+        // One that claims a height far beyond, with a tip the node does not
+        // hold, does not raise the bar for the others.
+        let mut boasting = peers.clone();
+        boasting.extend(connected(&[(7, 1_000_000_000, None)]));
+        assert!(leaves(false, &boasting, &at(500)));
+        // Nor do four that claim the node's height with tips it does not hold
+        // count as serving it.
+        let mut claiming = held(&[1, 2], 500);
+        claiming.extend(connected(&[
+            (3, 500, None),
+            (4, 500, None),
+            (5, 500, None),
+            (6, 500, None),
+        ]));
+        assert!(!leaves(false, &claiming, &at(500)));
+        // Nor four at the node's best header that were caught lacking a
+        // block on the way to it, or the headers to their tips.
+        let mut caught = held(&[1, 2], 500);
+        caught.extend(lacking(&[3, 4, 5, 6], 500));
+        assert!(!leaves(false, &caught, &at(500)));
+        // However many peers are at its best header, a node still
+        // downloading toward it keeps the seeds: here a new node that holds
+        // the seed's 325 blocks and the production chain's headers to 20,829.
+        let downloading = Event {
+            height: 325,
+            best: 20_829,
+            ..Default::default()
+        };
+        let mut far = held(&[1, 2], 20_829);
+        far.extend(held(&[3, 4, 5, 6], 20_829));
+        assert!(!leaves(false, &far, &downloading));
+        // One block behind, as while the newest block downloads, it is
+        // caught up; two behind, it is not.
+        let behind = |by: u64| Event {
+            height: 20_829 - by,
+            best: 20_829,
+            ..Default::default()
+        };
+        assert!(leaves(false, &far, &behind(1)));
+        assert!(!leaves(false, &far, &behind(2)));
+        // Nor does a node whose tip is stale leave them, nor one whose tip
+        // has gone stale since stay away.
+        assert!(!without_seeds(
+            false,
+            linked.clone(),
+            &book,
+            &peers,
+            8,
+            &at(500),
+            true
+        ));
+        assert!(leaves(true, &peers, &at(500)));
+        assert!(!without_seeds(
+            true,
+            linked.clone(),
+            &book,
+            &peers,
+            8,
+            &at(500),
+            true
+        ));
+        // Peers as high as the node's best header, before it holds a seed's
+        // tip, do not keep it from the seeds: they may all be behind, as a
+        // cluster on its own is until the seed's headers come.
+        let mut cluster = held(&[3, 4, 5, 6], 10);
+        cluster.extend(connected(&[(1, 500, None)]));
+        assert!(!leaves(false, &cluster, &at(10)));
+        cluster.extend(held(&[1], 500));
+        assert!(!leaves(false, &cluster, &at(500)));
+        // Nor does a node that holds no header past genesis leave them.
+        let genesis = held(&[1, 3, 4, 5, 6], 0);
+        assert!(!leaves(false, &genesis, &at(0)));
+        // Gone, a node comes back to the seeds only once fewer than a quarter
+        // of its peers are connected and not lacking, and with fewer than
+        // four, none.
+        let mut few = held(&[3], 500);
+        few.extend(connected(&[(4, 0, None)]));
+        assert!(leaves(true, &few, &at(500)));
+        let mut one = held(&[1], 500);
+        one.extend(connected(&[(4, 0, None)]));
+        assert!(!leaves(true, &one, &at(500)));
+        let mut found_out = held(&[1], 500);
+        found_out.extend(lacking(&[3, 4], 500));
+        assert!(!leaves(true, &found_out, &at(500)));
+        let three = |left, peers: &BTreeMap<String, Value>, linked: &[SocketAddr]| {
+            without_seeds(left, linked.to_vec(), &book, peers, 3, &at(500), false)
+        };
+        assert!(three(true, &one, &linked));
+        assert!(!three(true, &peers, &seeds));
+        // A node that reaches only the seeds keeps them, however few it wants.
+        let one_slot = |linked: &[SocketAddr]| {
+            without_seeds(false, linked.to_vec(), &book, &peers, 1, &at(500), false)
+        };
+        assert!(!one_slot(&seeds));
+        assert!(one_slot(&[a(1), a(4)]));
+        // The seeds take none of its slots: of these links, only the
+        // discovered peer that is not a seed takes one.
+        let links = [
+            (a(1), "discovered"),
+            (a(2), "discovered"),
+            (a(3), "config"),
+            (a(4), "discovered"),
+        ];
+        assert_eq!(slotted(links, &book), [a(4)]);
+    }
+
+    #[tokio::test]
+    async fn a_link_whose_task_panicked_ends_as_one_that_failed() {
+        let (a, b) = (
+            SocketAddr::from(([8, 1, 1, 1], 18442)),
+            SocketAddr::from(([8, 2, 1, 1], 18442)),
+        );
+        let mut tasks: JoinSet<Ended> = JoinSet::new();
+        let mut links: Links = BTreeMap::new();
+        links.insert(a, (tasks.spawn(async { panic!("a bug") }), "config"));
+        links.insert(b, (tasks.spawn(std::future::pending()), "discovered"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let done = loop {
+            let done = finished(&mut tasks, &mut links);
+            if !done.is_empty() || Instant::now() > deadline {
+                break done;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        // The panicked one is taken out as failed, so that it is connected
+        // again; the other goes on.
+        assert_eq!(done.len(), 1);
+        let (address, source, result) = &done[0];
+        assert_eq!((*address, *source), (a, "config"));
+        assert!(result.as_ref().is_err_and(|e| e.contains("panicked")));
+        assert_eq!(links.keys().copied().collect::<Vec<_>>(), [b]);
+        // One aborted, as a link that ends for a reason is, was taken out
+        // when it was, and is passed over.
+        links.remove(&b).unwrap().0.abort();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(finished(&mut tasks, &mut links).is_empty());
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_link_that_ends_after_its_task_finished_leaves_the_next_one_in_place() {
+        let a = SocketAddr::from(([8, 1, 1, 1], 18442));
+        let mut tasks: JoinSet<Ended> = JoinSet::new();
+        let mut links: Links = BTreeMap::new();
+        let closed = tasks.spawn(async move { (a, Err("connection closed".to_string())) });
+        links.insert(a, (closed, "discovered"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !links[&a].0.is_finished() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Its task finished, not yet joined, when the link is ended for a
+        // reason, as a peer connected again as a configured one is, and a
+        // new one takes its address.
+        links.remove(&a).unwrap().0.abort();
+        let again = tasks.spawn(std::future::pending());
+        let again_id = again.id();
+        links.insert(a, (again, "config"));
+        // The old task's end leaves the new link alone.
+        assert!(finished(&mut tasks, &mut links).is_empty());
+        assert_eq!(links[&a].0.id(), again_id);
+        assert_eq!(links[&a].1, "config");
+        links.remove(&a).unwrap().0.abort();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(finished(&mut tasks, &mut links).is_empty());
+        assert!(tasks.is_empty());
+    }
 }

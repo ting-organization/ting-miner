@@ -4,7 +4,7 @@ use crate::{
     config::{self, Config, Running},
     discovery::{self, AddressBook},
     mining::{self, Miner, Search, Selector},
-    peers, reads,
+    peers, progress, reads, rest,
     transport::{self, Inbound, PeerStats},
 };
 use serde_json::{Value, json};
@@ -34,6 +34,8 @@ pub struct Node {
     pub token: Arc<str>,
     pub shutdown: Arc<AtomicBool>,
     pub info: Arc<Mutex<Running>>,
+    /// Each outbound connection's status. Whoever holds both locks takes
+    /// `book` first.
     pub peers: PeerStats,
     /// Addresses of other nodes, and whether to discover more (read at start).
     pub book: Arc<Mutex<AddressBook>>,
@@ -60,7 +62,7 @@ pub type SearchFactory = Arc<dyn Fn(u32) -> Arc<dyn Search> + Send + Sync>;
 async fn terminated() {
     let interrupted = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
-            eprintln!("shutdown signal: {e}");
+            crate::log!("shutdown signal: {e}");
             std::future::pending::<()>().await;
         }
     };
@@ -72,7 +74,7 @@ async fn terminated() {
                 tokio::select! {_=interrupted=>{},_=term.recv()=>{}}
             }
             Err(e) => {
-                eprintln!("termination signal: {e}");
+                crate::log!("termination signal: {e}");
                 interrupted.await;
             }
         }
@@ -83,15 +85,70 @@ async fn terminated() {
 /// The addresses `seeds`, `host:port` names, resolve to, each looked up for at
 /// most five seconds; a name that does not resolve is passed over.
 pub async fn seed_addresses(seeds: &[&str]) -> Vec<std::net::SocketAddr> {
+    resolve(seeds, true).await
+}
+/// The addresses `seeds` resolve to, with what each gave written to the log
+/// if `logged`.
+async fn resolve(seeds: &[&str], logged: bool) -> Vec<std::net::SocketAddr> {
     let mut addresses = Vec::new();
     for seed in seeds {
         let lookup = tokio::net::lookup_host(*seed);
         match tokio::time::timeout(Duration::from_secs(5), lookup).await {
-            Ok(Ok(found)) => addresses.extend(found),
-            _ => eprintln!("seed {seed} did not resolve"),
+            Ok(Ok(found)) => {
+                let before = addresses.len();
+                addresses.extend(found);
+                let n = addresses.len() - before;
+                if logged {
+                    crate::log!(
+                        "seed node {seed}: {n} address{}",
+                        if n == 1 { "" } else { "es" }
+                    );
+                }
+            }
+            _ if logged => crate::log!("seed node {seed} did not resolve"),
+            _ => {}
         }
     }
     addresses
+}
+/// The seed names are looked up again this often, as often as an address that
+/// keeps failing is tried again, so that a seed whose address changed is found
+/// by the time its old one would have been tried; and every minute, the first
+/// wait after a failure, while the book holds no seed address the node may
+/// connect to.
+pub const SEED_LOOKUP: Duration = Duration::from_secs(3600);
+pub const SEED_RETRY: Duration = Duration::from_secs(60);
+/// Keeps the seed nodes' addresses in `book` until `shutdown`: looks `seeds` up
+/// at once, then every `every`, and every `retry` while the book holds no seed
+/// address the node may connect to, as when bans or failures cover them all, so
+/// that a node going back to the seeds finds them. Only the first lookup is
+/// written to the log: a later one that fails is passed over quietly.
+pub async fn keep_seeds(
+    book: Arc<Mutex<AddressBook>>,
+    seeds: &[&str],
+    shutdown: Arc<AtomicBool>,
+    every: Duration,
+    retry: Duration,
+) {
+    let mut logged = true;
+    loop {
+        for address in resolve(seeds, logged).await {
+            book.lock().unwrap().learn_seed(address);
+        }
+        logged = false;
+        let looked = tokio::time::Instant::now();
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(retry.min(Duration::from_secs(2))) => {}
+                _ = transport::wait_stopped(&shutdown) => return,
+            }
+            let none = !book.lock().unwrap().seed_due(crate::now());
+            let since = looked.elapsed();
+            if since >= every || none && since >= retry {
+                break;
+            }
+        }
+    }
 }
 /// What a fork of this node replaces: how templates pick transactions and how
 /// nonces are searched. The reference node uses first-in selection and the CPU.
@@ -145,25 +202,31 @@ impl Node {
             "mine" => self.mine(params).await,
             "peers" => {
                 let config = self.handle.call("config", json!({})).await?;
-                let stats = self.peers.lock().unwrap();
-                let mut items: Vec<Value> = config["peers"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|address| {
-                        stats.get(address.as_str().unwrap()).cloned().unwrap_or(
-                            json!({"address":address,"source":"config","error":null,"last_success":null}),
-                        )
-                    })
-                    .collect();
-                items.extend(
-                    stats
-                        .values()
-                        .filter(|v| v["source"] == "discovered")
-                        .cloned(),
-                );
+                // The statuses are let go before the book is taken: the peer
+                // loop takes the book first.
+                let items = {
+                    let stats = self.peers.lock().unwrap();
+                    let mut items: Vec<Value> = config["peers"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|address| {
+                            stats.get(address.as_str().unwrap()).cloned().unwrap_or(
+                                json!({"address":address,"source":"config","error":null,"last_success":null}),
+                            )
+                        })
+                        .collect();
+                    items.extend(
+                        stats
+                            .values()
+                            .filter(|v| v["source"] == "discovered")
+                            .cloned(),
+                    );
+                    items
+                };
                 Ok(json!({
                     "items":items,
+                    "inbound":self.inbound.lock().unwrap().peers(),
                     "discovery":config["discovery"],
                     "max_peers":config["max_peers"],
                     "known":self.book.lock().unwrap().len(),
@@ -295,17 +358,15 @@ struct ApiServer {
     stop: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
 }
-fn launch_api(listener: TcpListener, node: Node, cors: bool) -> ApiServer {
+/// REST on `listener`, with up to `connections` connections at once.
+fn launch_api(listener: TcpListener, node: Node, cors: bool, connections: usize) -> ApiServer {
     let (stop, stopped) = oneshot::channel();
     let task = tokio::spawn(async move {
-        let app =
-            api::router(node, cors).into_make_service_with_connect_info::<std::net::SocketAddr>();
-        let server = axum::serve(listener, app).with_graceful_shutdown(async {
+        let limits = rest::Limits::new(connections);
+        rest::serve(listener, api::router(node, cors), limits, async {
             let _ = stopped.await;
-        });
-        if let Err(e) = server.await {
-            eprintln!("REST service: {e}");
-        }
+        })
+        .await;
     });
     ApiServer { stop, task }
 }
@@ -325,9 +386,12 @@ async fn api_manager(
     dir: PathBuf,
     mut changes: mpsc::Receiver<ApiChange>,
     initial: Option<(TcpListener, bool)>,
+    connections: usize,
 ) {
-    let mut server =
-        initial.map(|(listener, cors)| (launch_api(listener, node.clone(), cors), cors));
+    let mut server = initial.map(|(listener, cors)| {
+        let server = launch_api(listener, node.clone(), cors, connections);
+        (server, cors)
+    });
     loop {
         let change = tokio::select! {c=changes.recv()=>c,_=node.stopped()=>break};
         let Some(change) = change else {
@@ -354,7 +418,8 @@ async fn api_manager(
                 node.handle
                     .call("api_config", json!({"enabled":true,"cors":change.cors}))
                     .await?;
-                server = Some((launch_api(listener, node.clone(), change.cors), change.cors));
+                let active = launch_api(listener, node.clone(), change.cors, connections);
+                server = Some((active, change.cors));
                 node.info.lock().unwrap().api = Some(address);
             } else if !change.enabled && server.is_some() {
                 node.handle
@@ -383,6 +448,18 @@ pub async fn run_with(dir: &Path, mining: Mining) -> Result<()> {
     let lock = config::lock(dir)?;
     let c = Config::load(dir)?;
     let token = config::token(dir)?;
+    // REST never takes the descriptors that peers and storage may need: the
+    // limit is raised to leave room for both if it can be, and REST takes
+    // what is left of it (wiki: node/security#the-rest-interface).
+    let reserved = rest::reserved(c.max_inbound, c.max_peers);
+    let limit = rest::descriptors(reserved.saturating_add(rest::CONNECTIONS_MAX as u64));
+    let connections = rest::connections(limit, reserved);
+    if let Some(limit) = limit.filter(|_| connections < rest::CONNECTIONS_MAX) {
+        crate::log!(
+            "open-file limit {limit}: REST takes at most {connections} connections at once, \
+             leaving {reserved} for peers and storage"
+        );
+    }
     let control = TcpListener::bind(c.control)
         .await
         .map_err(|e| format!("control listener: {e}"))?;
@@ -429,7 +506,7 @@ pub async fn run_with(dir: &Path, mining: Mining) -> Result<()> {
         book: Arc::new(Mutex::new(book)),
         discovery: c.discovery,
         mempool: c.mempool_transactions,
-        inbound: Arc::new(Mutex::new(Inbound::default())),
+        inbound: Arc::new(Mutex::new(Inbound::new(c.max_inbound as usize))),
         nonce: discovery::seed(),
         miner: Arc::new(Mutex::new(None)),
         search: mining.search,
@@ -437,15 +514,18 @@ pub async fn run_with(dir: &Path, mining: Mining) -> Result<()> {
         changes,
     };
     // On the production network, the built-in seeds are looked up in the
-    // background; their addresses join the book like any other.
+    // background, and again from time to time; their addresses join the book
+    // as seeds', picked after every other (wiki: node/sync#finding-more-peers).
     let production = config::production_genesis().map(|g| g.chain_id());
     if c.discovery && production == Some(config::genesis(dir)?.chain_id()) {
-        let book = node.book.clone();
-        tokio::spawn(async move {
-            for address in seed_addresses(config::SEEDS).await {
-                book.lock().unwrap().learn(address, discovery::Source::Seed);
-            }
-        });
+        let (book, shutdown) = (node.book.clone(), node.shutdown.clone());
+        tokio::spawn(keep_seeds(
+            book,
+            config::SEEDS,
+            shutdown,
+            SEED_LOOKUP,
+            SEED_RETRY,
+        ));
     }
     if c.miner_enabled {
         *node.miner.lock().unwrap() = Some(Miner::start(
@@ -455,7 +535,8 @@ pub async fn run_with(dir: &Path, mining: Mining) -> Result<()> {
         ));
     }
     println!(
-        "Ting ready: control={} peers={} REST={}",
+        "{} Ting ready: control={} peers={} REST={}",
+        crate::log::utc(crate::now()),
         info.control,
         info.p2p,
         info.api
@@ -464,23 +545,26 @@ pub async fn run_with(dir: &Path, mining: Mining) -> Result<()> {
     let control_task = tokio::spawn(transport::control_server(control, node.clone()));
     let peer_task = tokio::spawn(transport::peer_server(p2p, node.clone()));
     let sync_task = tokio::spawn(peers::run(node.clone()));
+    let progress_task = tokio::spawn(progress::run(node.clone()));
     let api_task = tokio::spawn(api_manager(
         node.clone(),
         dir.into(),
         receiver,
         api.map(|listener| (listener, c.api_cors)),
+        connections,
     ));
     tokio::select! {_=node.stopped()=>{},_=terminated()=>{}}
     shutdown.store(true, Ordering::Relaxed);
     control_task.abort();
     peer_task.abort();
     sync_task.abort();
+    progress_task.abort();
     node.stop_miner().await;
     let _ = api_task.await;
     let _ = worker.join();
     // Addresses learned since the last round are hints worth keeping.
     if let Err(e) = node.book.lock().unwrap().save() {
-        eprintln!("peer address book: {e}");
+        crate::log!("peer address book: {e}");
     }
     std::fs::remove_file(dir.join("runtime.json")).map_err(|e| e.to_string())?;
     // The data directory stays locked until the process exits: aborted tasks

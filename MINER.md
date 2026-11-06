@@ -203,6 +203,9 @@ The miner changes as little of Ting as it can, so merges stay clean:
   with `payout::mining` instead of the defaults: a line each. `main.rs` also has
   `ting miner payout`, the payout account in `ting miner status` and the production
   policy `ting init` writes, a few lines calling `payout.rs`;
+- `node/src/show.rs`, the commands' text, shows the miner's searches as
+  `search::text` words them and the payout account in `ting miner status`: a line
+  each;
 - `README.md` starts with the miner's own part, above Ting's title, which a merge
   leaves alone unless Ting changes that title;
 - `node/Cargo.toml` adds wgpu and pollster under the `gpu` feature, and

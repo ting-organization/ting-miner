@@ -171,7 +171,7 @@ fn a_heavier_branch_that_fails_on_the_way_leaves_the_tip_where_it_was() {
     // Two blocks overtake the tip: it is disconnected, the first of them fails,
     // and the tip is connected again. Nothing was replaced.
     let b = forged(&g, 2);
-    headers_from(&mut chain, &headers_of(&b)).unwrap();
+    sync_headers(&mut chain, &headers_of(&b));
     chain.import(&b[1].encode(), true).unwrap();
     chain.import(&b[0].encode(), true).unwrap();
     assert_eq!(chain.tip(), a[0].header.id());
@@ -198,7 +198,7 @@ fn a_reorganization_that_fails_part_way_returns_to_the_tip_it_left() {
     while !consensus::valid_pow(&last.header) {
         last.header.nonce += 1;
     }
-    headers_from(&mut chain, &headers_of(&b)).unwrap();
+    sync_headers(&mut chain, &headers_of(&b));
     for block in &b[..3] {
         chain.import(&block.encode(), true).unwrap();
     }
@@ -257,11 +257,12 @@ fn a_reorganization_that_forks_again_reports_from_its_lowest_height() {
     for block in &a {
         chain.import(&block.encode(), true).unwrap();
     }
-    for blocks in [&x, &y] {
-        headers_from(&mut chain, &headers_of(blocks)).unwrap();
-    }
+    // X's headers overtake A and are indexed; Y's, of X's work, are not
+    // while X's are the best, and its blocks are stored as they come.
+    sync_headers(&mut chain, &headers_of(&x));
+    assert_eq!(sync_headers(&mut chain, &headers_of(&y))["indexed"], 0);
     // Every body but X's first, so that nothing is connected before it.
-    for block in x[1..].iter().chain(&y).rev() {
+    for block in x[1..].iter().chain(&y) {
         chain.import(&block.encode(), true).unwrap();
     }
     assert_eq!(chain.tip(), a[4].header.id());
@@ -282,6 +283,20 @@ fn headers_from(chain: &mut Chain, headers: &[Header]) -> Result<serde_json::Val
 }
 fn headers_of(blocks: &[Block]) -> Vec<Header> {
     blocks.iter().map(|b| b.header.clone()).collect()
+}
+/// A peer's chain of headers as a connection hands it to the node: asked for
+/// again from where it forks once a presync shows its work, as a peer is.
+fn sync_headers(chain: &mut Chain, headers: &[Header]) -> serde_json::Value {
+    let answer = headers_from(chain, headers).unwrap();
+    if answer["refetch"] != true {
+        return answer;
+    }
+    let start = answer["next"].as_str().unwrap();
+    let from = headers
+        .iter()
+        .position(|h| hex(&h.parent) == start)
+        .unwrap();
+    headers_from(chain, &headers[from..]).unwrap()
 }
 /// A peer request the chain answers itself.
 fn ask(chain: &mut Chain, request: wire::Request) -> Result<wire::Answer, String> {
@@ -505,6 +520,118 @@ fn a_relayed_transaction_a_recent_block_included_is_refused() {
         ting_node::chain::INCLUDED
     );
 }
+/// Relays `tx` as a peer would.
+fn relay(
+    chain: &mut Chain,
+    tx: &ting_core::protocol::Transaction,
+) -> Result<serde_json::Value, String> {
+    chain.request(
+        "submit",
+        json!({"hex":hex(&tx.encode()),"relayed":true,"peer":"192.0.2.1:18442"}),
+    )
+}
+#[test]
+fn a_relayed_transaction_that_succeeded_after_failing_in_the_same_block_is_refused() {
+    let dir = Directory::new();
+    dir.config(false, "test");
+    let mut chain = open(&dir);
+    let g = chain.genesis.clone();
+    let chain_id = g.chain_id();
+    let deploy = support::tx();
+    let contract = {
+        let mut bytes = chain_id.to_vec();
+        bytes.extend(deploy.id(chain_id));
+        bytes.extend(0u64.to_le_bytes());
+        ting_core::hash::hash("contract", &bytes)
+    };
+    let program = call(&hex(&contract), vec![]);
+    let nothing = call(&hex(&[7; 32]), vec![]);
+    // One block calls the program twice before it exists and once after,
+    // and calls nothing three times.
+    let runtime = Runtime::new(State::default(), Context::from_genesis(&g));
+    let mut history = vec![];
+    let block = mine(
+        &runtime,
+        &g,
+        &mut history,
+        vec![
+            program.clone(),
+            nothing.clone(),
+            program.clone(),
+            nothing.clone(),
+            deploy,
+            program.clone(),
+            nothing.clone(),
+        ],
+        "A",
+    );
+    let succeeded: Vec<bool> = block
+        .receipts
+        .iter()
+        .map(|r| r.status == ting_core::protocol::Status::Success)
+        .collect();
+    assert_eq!(succeeded, [false, false, false, false, true, true, false]);
+    chain.import(&block.encode(), true).unwrap();
+    for _ in 0..ting_node::chain::RELAY_ECHO {
+        let empty = mine(&runtime, &g, &mut history, vec![], "A");
+        chain.import(&empty.encode(), true).unwrap();
+    }
+    // Past the block's echo only a success refuses: the program's call
+    // succeeded at its last occurrence, the other call at none.
+    assert_eq!(
+        relay(&mut chain, &program).unwrap_err(),
+        ting_node::chain::INCLUDED
+    );
+    assert_eq!(relay(&mut chain, &nothing).unwrap()["known"], false);
+}
+#[test]
+fn a_relayed_transaction_is_checked_once_per_block_however_often_blocks_include_it() {
+    use std::time::{Duration, Instant};
+    // A pool of one, which the operator's own transaction fills and never
+    // gives up: every relayed submission is checked, then refused.
+    let dir = Directory::new();
+    dir.config(false, "test");
+    let mut c = config::Config::load(&dir.0).unwrap();
+    c.mempool_transactions = 1;
+    c.save(&dir.0).unwrap();
+    let mut chain = open(&dir);
+    chain.submit(&support::tx().encode()).unwrap();
+    // Ten blocks, each holding a failing call a thousand times and another
+    // once, then enough empty ones for their echo to end, so that only the
+    // check for a success reads them.
+    let g = chain.genesis.clone();
+    let runtime = Runtime::new(State::default(), Context::from_genesis(&g));
+    let mut history = vec![];
+    let many = call(&hex(&[7; 32]), vec![]);
+    let once = call(&hex(&[8; 32]), vec![]);
+    for _ in 0..10 {
+        let mut transactions = vec![many.clone(); 1_000];
+        transactions.push(once.clone());
+        let block = mine(&runtime, &g, &mut history, transactions, "A");
+        chain.import(&block.encode(), true).unwrap();
+    }
+    for _ in 0..ting_node::chain::RELAY_ECHO {
+        let empty = mine(&runtime, &g, &mut history, vec![], "A");
+        chain.import(&empty.encode(), true).unwrap();
+    }
+    let fastest = |chain: &mut Chain, tx: &ting_core::protocol::Transaction| {
+        (0..3)
+            .map(|_| {
+                let started = Instant::now();
+                assert_eq!(relay(chain, tx).unwrap_err(), ting_node::chain::POOL_FULL);
+                started.elapsed()
+            })
+            .min()
+            .unwrap()
+    };
+    let (many, once) = (fastest(&mut chain, &many), fastest(&mut chain, &once));
+    // Both read the same ten blocks, once each: a thousand occurrences in a
+    // block cost about what one does, not a thousand reads of it.
+    assert!(
+        many < once * 10 + Duration::from_millis(50),
+        "{many:?} for a thousand occurrences a block, {once:?} for one"
+    );
+}
 #[test]
 fn a_block_that_fails_names_the_peer_that_sent_it() {
     let dir = Directory::new();
@@ -592,6 +719,54 @@ fn rejects_invalid_bodies_unknown_parents_and_header_work() {
     );
     assert!(!dir.0.join("blocks").exists());
     assert!(dir.0.join("chain.redb").exists());
+}
+#[test]
+fn a_pushed_block_whose_body_fails_leaves_no_header_behind() {
+    // Blocks above the tip pushed with no body that matches their headers,
+    // as by a peer that never means to deliver them: each is invalid data,
+    // and none leaves its header indexed, so the best header stays where
+    // the node's blocks are and nothing waits for a block nobody has.
+    let dir = Directory::new();
+    dir.config(false, "test");
+    let mut chain = open(&dir);
+    let g = chain.genesis.clone();
+    let r = Runtime::new(State::default(), Context::from_genesis(&g));
+    let mut h = vec![];
+    for _ in 0..3 {
+        let b = mine(&r, &g, &mut h, vec![], "A");
+        chain.import(&b.encode(), true).unwrap();
+    }
+    let b4 = mine(&r, &g, &mut h, vec![support::tx()], "A");
+    let b5 = mine(&r, &g, &mut h, vec![], "A");
+    let mut receipt = b4.clone();
+    receipt.receipts[0].result[0] ^= 1;
+    let mut producer = b4.clone();
+    producer.producer = b"B".to_vec();
+    let mut trailing = b4.encode();
+    trailing.push(0);
+    for bytes in [
+        b4.header.encode(),
+        receipt.encode(),
+        producer.encode(),
+        trailing,
+    ] {
+        let error = chain.import(&bytes, true).unwrap_err();
+        assert!(ting_node::chain::is_invalid(&error), "{error}");
+        assert_eq!(chain.event().best, 3, "{error}");
+    }
+    // The next block's header finds no parent.
+    assert_eq!(
+        chain.import(&b5.header.encode(), true).unwrap_err(),
+        "unknown parent"
+    );
+    assert_eq!(chain.event().best, 3);
+    // The blocks themselves are taken whole as before.
+    chain.import(&b4.encode(), true).unwrap();
+    let error = chain.import(&b5.header.encode(), true).unwrap_err();
+    assert!(ting_node::chain::is_invalid(&error), "{error}");
+    assert_eq!((chain.event().height, chain.event().best), (4, 4));
+    chain.import(&b5.encode(), true).unwrap();
+    assert_eq!((chain.event().height, chain.event().best), (5, 5));
 }
 #[test]
 fn truncated_tail_repairs_and_indexed_block_corruption_is_rejected_on_read() {
@@ -1517,6 +1692,41 @@ fn the_pool_shares_its_room_by_address() {
     assert!(status["mempool_bytes"].as_u64().unwrap() < 4 * 1_048_576);
 }
 #[test]
+fn the_addresses_of_an_ipv6_64_hold_one_share_of_the_pool() {
+    use std::net::IpAddr;
+    let dir = Directory::new();
+    dir.config(false, "test");
+    let mut c = config::Config::load(&dir.0).unwrap();
+    c.mempool_transactions = 8;
+    c.save(&dir.0).unwrap();
+    let mut chain = open(&dir);
+    let chain_id = chain.genesis.chain_id();
+    let tx = |source: u8, i: u16| {
+        let mut input = i.to_le_bytes().to_vec();
+        input.extend([source, 0x64]);
+        variant(input)
+    };
+    let honest: IpAddr = "198.51.100.4".parse().unwrap();
+    for i in 0..4 {
+        chain.submit_from(&tx(1, i).encode(), Some(honest)).unwrap();
+    }
+    // Each from another address of one /64: four fill the pool, and then the
+    // /64 holds as many as the other address, so it takes none of its places.
+    for i in 0..8u16 {
+        let address: IpAddr = format!("2001:db8:1:2::{:x}", i + 1).parse().unwrap();
+        let answer = chain.submit_from(&tx(2, i).encode(), Some(address));
+        if i < 4 {
+            answer.unwrap();
+        } else {
+            assert_eq!(answer.unwrap_err(), ting_node::chain::POOL_FULL);
+        }
+    }
+    for i in 0..4 {
+        let id = hex(&tx(1, i).id(chain_id));
+        assert!(chain.request("transaction", json!({"id":id})).is_ok());
+    }
+}
+#[test]
 fn a_fork_chooses_what_gives_way_in_a_full_pool() {
     use ting_core::vm::Candidate;
     use ting_node::{
@@ -1749,6 +1959,40 @@ fn the_deferred_set_shares_its_room_by_address_and_keeps_what_is_due_first() {
             .unwrap_err(),
         ting_node::chain::DEFERRED_FULL
     );
+}
+#[test]
+fn the_addresses_of_an_ipv6_64_hold_one_share_of_the_deferred_set() {
+    use std::net::IpAddr;
+    let dir = Directory::new();
+    dir.config(false, "test");
+    let mut chain = open(&dir);
+    let now = ting_node::now();
+    let tx = |source: u8, i: u16| {
+        let mut input = i.to_le_bytes().to_vec();
+        input.extend([source, 0x64]);
+        variant(input)
+    };
+    // 256 from as many addresses of one /64; the next address of it is
+    // refused, and an address of another /64 is not.
+    let address = |i: u16| -> IpAddr { format!("2001:db8:1:2::{:x}", i + 1).parse().unwrap() };
+    for i in 0..256 {
+        chain
+            .submit_deferred_from(&tx(1, i).encode(), now + 1_000, Some(address(i)))
+            .unwrap();
+    }
+    assert_eq!(
+        chain
+            .submit_deferred_from(&tx(1, 256).encode(), now + 1_000, Some(address(256)))
+            .unwrap_err(),
+        ting_node::chain::DEFERRED_FULL
+    );
+    chain
+        .submit_deferred_from(
+            &tx(2, 0).encode(),
+            now + 1_000,
+            Some("2001:db8:1:3::1".parse().unwrap()),
+        )
+        .unwrap();
 }
 #[test]
 fn only_header_and_block_checks_prove_invalid_data() {
@@ -2491,6 +2735,73 @@ fn a_branch_below_the_undo_window_is_reached_by_replaying_from_genesis() {
     assert_eq!(chain.height(), 11);
 }
 #[test]
+fn the_pruned_height_holds_when_the_tip_falls_below_where_it_was() {
+    // An undo window of three: eight blocks, every other one changing state,
+    // leave no undo data at heights 1 to 5.
+    let dir = Directory::new();
+    dir.config(false, "test");
+    let mut c = config::Config::load(&dir.0).unwrap();
+    c.undo_window = 3;
+    c.save(&dir.0).unwrap();
+    let mut chain = open(&dir);
+    let g = chain.genesis.clone();
+    let runtime = Runtime::new(State::default(), Context::from_genesis(&g));
+    let mut history = vec![];
+    let a: Vec<Block> = (0..8u8)
+        .map(|i| {
+            let txs = if i % 2 == 0 {
+                vec![variant(vec![i])]
+            } else {
+                vec![]
+            };
+            mine(&runtime, &g, &mut history, txs, "A")
+        })
+        .collect();
+    for block in &a {
+        chain.import(&block.encode(), true).unwrap();
+    }
+    let pruned =
+        |chain: &mut Chain| chain.request("status", json!({})).unwrap()["undo_pruned"].clone();
+    assert_eq!(pruned(&mut chain), 5);
+    let fork = |at: usize, n: usize, producer: &str| -> Vec<Block> {
+        let runtime = Runtime::new(State::default(), Context::from_genesis(&g));
+        let mut history = vec![];
+        for block in &a[..at] {
+            runtime
+                .validate_and_apply_block(&g, &history, block)
+                .unwrap();
+            history.push(block.header.clone());
+        }
+        (0..n)
+            .map(|_| mine(&runtime, &g, &mut history, vec![], producer))
+            .collect()
+    };
+    // The tip falls to height 6, as in the middle of a reorganization or
+    // after the operator's mark, and a block connects at 7: the window now
+    // ends at 4, but height 5 has no undo data any more, and the pruned
+    // height says so still.
+    chain
+        .request("invalidate", json!({"id":hex(&a[6].header.id())}))
+        .unwrap();
+    assert_eq!(chain.height(), 6);
+    chain.import(&fork(6, 1, "C")[0].encode(), true).unwrap();
+    assert_eq!(chain.height(), 7);
+    assert_eq!(pruned(&mut chain), 5);
+    // So a heavier branch forking at height 4 is reached by the replay
+    // rather than by undoing height 5 with data it no longer has.
+    let b = fork(4, 4, "B");
+    for block in &b {
+        chain.import(&block.encode(), true).unwrap();
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while chain.tip() != b[3].header.id() {
+        assert!(std::time::Instant::now() < deadline, "no reorganization");
+        chain.resume_activation();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(chain.height(), 8);
+}
+#[test]
 fn settled_blocks_leave_memory_and_branches_below_them_are_still_followed() {
     // The experimental profile, epochs of four blocks, and an undo window of
     // three: the index holds the last 23 canonical blocks at least, three
@@ -3124,8 +3435,9 @@ fn a_chain_far_behind_is_checked_without_being_kept_until_it_overtakes() {
     let g = chain.genesis.clone();
     // Two branches from genesis, both mined on schedule, so every block
     // carries the initial target's work: A, 1,450 blocks, connected first;
-    // B, 1,460, which overtakes it. A header chain is indexed once within
-    // 1,440 blocks of the tip's work, so B's first headers are not.
+    // B, 1,460, which overtakes it. A header chain is indexed once it
+    // overtakes the best header, so B's are not until its 1,451st, and a
+    // block more than 1,440 blocks of work behind the tip is not taken.
     let build = |n: usize, producer: &str| -> Vec<Block> {
         let runtime = Runtime::new(State::default(), Context::from_genesis(&g));
         let mut history = vec![];
@@ -3148,7 +3460,8 @@ fn a_chain_far_behind_is_checked_without_being_kept_until_it_overtakes() {
     );
     let headers = |range: std::ops::Range<usize>| headers_of(&b[range]);
     // Checked as it streams, nothing kept: five headers do not reach the
-    // threshold, the next five do, and the peer is asked again from genesis.
+    // threshold, nor do the next 1,445; the one after does, and the peer is
+    // asked again from genesis.
     let first = headers_from(&mut chain, &headers(0..5)).unwrap();
     assert_eq!(
         (first["indexed"].clone(), first["refetch"].clone()),
@@ -3182,7 +3495,12 @@ fn a_chain_far_behind_is_checked_without_being_kept_until_it_overtakes() {
     };
     let held = headers_from(&mut chain, std::slice::from_ref(&early.header)).unwrap();
     assert_eq!(held["next"], serde_json::Value::Null);
-    let reached = headers_from(&mut chain, &headers(5..20)).unwrap();
+    let short = headers_from(&mut chain, &headers(5..1_450)).unwrap();
+    assert_eq!(
+        (short["indexed"].clone(), short["refetch"].clone()),
+        (json!(0), json!(false))
+    );
+    let reached = headers_from(&mut chain, &headers(1_450..1_455)).unwrap();
     assert_eq!(reached["refetch"], true);
     assert_eq!(reached["next"], hex(&g.block_id()));
     let after = status(&mut chain);
@@ -3208,6 +3526,63 @@ fn a_chain_far_behind_is_checked_without_being_kept_until_it_overtakes() {
     drop(chain);
     let chain = open(&dir);
     assert_eq!(chain.tip(), b[1_459].header.id());
+}
+#[test]
+fn a_page_begins_at_most_one_presync_however_often_a_header_repeats() {
+    let dir = Directory::new();
+    dir.config(false, "repeats");
+    let mut chain = open(&dir);
+    let g = chain.genesis.clone();
+    // A chain of 2,000 blocks, and a header on a branch from its block 500,
+    // too far behind to be indexed: a presync for it begins by walking the
+    // branch back from there.
+    let runtime = Runtime::new(State::default(), Context::from_genesis(&g));
+    let mut history = vec![];
+    let mut side = None;
+    for i in 0..2_000 {
+        if i == 500 {
+            let mut x = runtime
+                .build_candidate(
+                    &g,
+                    &history,
+                    vec![],
+                    g.timestamp + 60 * (history.len() as u64 + 1),
+                    [0; 4],
+                    b"X".to_vec(),
+                )
+                .unwrap();
+            while !consensus::valid_pow(&x.header) {
+                x.header.nonce += 1;
+            }
+            side = Some(x.header);
+        }
+        let block = mine(&runtime, &g, &mut history, vec![], "A");
+        chain.import(&block.encode(), true).unwrap();
+    }
+    let side = side.unwrap();
+    let timed = |chain: &mut Chain, page: &[Header]| {
+        let started = std::time::Instant::now();
+        let answer = headers_from(chain, page).unwrap();
+        (answer, started.elapsed())
+    };
+    // Alone, it begins one, as any page from far back does.
+    let (one, alone) = timed(&mut chain, std::slice::from_ref(&side));
+    assert_eq!(one["next"], hex(&side.id()));
+    assert_eq!(one["indexed"], 0);
+    // Repeated through a whole page, it begins one too: the copy that does
+    // not follow it ends the page, and costs no second walk.
+    let page = vec![side.clone(); 2_000];
+    let (repeated, took) = timed(&mut chain, &page);
+    assert_eq!(repeated["next"], serde_json::Value::Null);
+    assert_eq!(repeated["indexed"], 0);
+    assert!(
+        took < alone * 20 + std::time::Duration::from_millis(100),
+        "{took:?} for the page against {alone:?} for one header"
+    );
+    // And alone again, it still begins one.
+    let (again, _) = timed(&mut chain, std::slice::from_ref(&side));
+    assert_eq!(again["next"], hex(&side.id()));
+    assert_eq!(chain.height(), 2_000);
 }
 #[test]
 fn a_damaged_deferred_set_is_set_aside_and_the_node_starts() {
@@ -3745,6 +4120,136 @@ fn an_address_whose_transaction_was_just_tried_lets_the_others_go_first() {
     // the attacker's next loop.
     assert_eq!(templates_until(&mut chain, &hex(&honest.id(chain_id))), 2);
 }
+/// A deployment whose initializer loops until it has used exactly a block's
+/// compute: it fails, so its sender pays nothing, and it fills the block.
+fn filler(chain: &Chain, n: u64) -> ting_core::protocol::Transaction {
+    ting_core::protocol::Transaction {
+        budget: ting_core::meter::Resources([chain.genesis.initial.0[0], 16, 4096, 4096]),
+        payload: ting_core::protocol::Payload::Deploy {
+            code: wat::parse_str("(module (func (export \"invoke\") (loop br 0)))").unwrap(),
+            input: n.to_le_bytes().to_vec(),
+        },
+    }
+}
+#[test]
+fn new_block_fillers_from_two_addresses_do_not_keep_a_waiting_transaction_out() {
+    let dir = Directory::new();
+    dir.config(false, "test");
+    let mut chain = open(&dir);
+    let chain_id = chain.genesis.chain_id();
+    let ip = |s: &str| Some(s.parse::<std::net::IpAddr>().unwrap());
+    let attackers = [ip("203.0.113.7"), ip("203.0.113.8")];
+    chain
+        .submit_from(&filler(&chain, 0).encode(), attackers[0])
+        .unwrap();
+    let honest = support::tx();
+    chain
+        .submit_from(&honest.encode(), ip("198.51.100.4"))
+        .unwrap();
+    let honest = hex(&honest.id(chain_id));
+    // A new filler from the other address before every block: each is one no
+    // template has run, from an address none has taken one of lately.
+    let mut mined = None;
+    for n in 1..=6u64 {
+        let answer = chain.mine(1, 1_000_000).unwrap();
+        let block = chain
+            .request("block", json!({"id":answer["blocks"][0]["id"]}))
+            .unwrap();
+        let transactions = block["transactions"].as_array().unwrap();
+        assert_eq!(transactions.len(), 1, "every block holds one transaction");
+        if transactions[0] == json!(honest) {
+            mined.get_or_insert(n);
+        }
+        chain
+            .submit_from(&filler(&chain, n).encode(), attackers[(n % 2) as usize])
+            .unwrap();
+    }
+    // The first filler arrived first and fills the first block; the honest
+    // transaction has waited longer than the next one and goes in the second.
+    assert_eq!(mined, Some(2));
+}
+#[test]
+fn address_ranges_take_turns_and_a_new_one_joins_at_the_back() {
+    let dir = Directory::new();
+    dir.config(false, "test");
+    let mut chain = open(&dir);
+    let chain_id = chain.genesis.chain_id();
+    let ip = |s: &str| Some(s.parse::<std::net::IpAddr>().unwrap());
+    let id = |tx: &ting_core::protocol::Transaction| json!([hex(&tx.id(chain_id))]);
+    let next =
+        |chain: &mut Chain| chain.request("template", json!({})).unwrap()["transactions"].clone();
+    // Two fillers from addresses in one IPv6 /64, then one from an IPv4
+    // address, then an honest transaction: each fills a template alone.
+    let (a, b, c) = (filler(&chain, 0), filler(&chain, 1), filler(&chain, 2));
+    chain
+        .submit_from(&a.encode(), ip("2001:db8:1:2::1"))
+        .unwrap();
+    chain
+        .submit_from(&b.encode(), ip("2001:db8:1:2::ff"))
+        .unwrap();
+    chain.submit_from(&c.encode(), ip("203.0.113.7")).unwrap();
+    let honest = support::tx();
+    chain
+        .submit_from(&honest.encode(), ip("198.51.100.4"))
+        .unwrap();
+    // The /64 is one range: its second filler waits until the other ranges
+    // have had their turn, and each range goes to the back after its own.
+    assert_eq!(next(&mut chain), id(&a));
+    assert_eq!(next(&mut chain), id(&c));
+    assert_eq!(next(&mut chain), id(&honest));
+    // A new range arrives with a filler no template has run: it joins at the
+    // back, behind the /64, whose turn has come round again.
+    let d = filler(&chain, 3);
+    chain.submit_from(&d.encode(), ip("192.0.2.9")).unwrap();
+    assert_eq!(next(&mut chain), id(&a));
+    assert_eq!(next(&mut chain), id(&c));
+    assert_eq!(next(&mut chain), id(&honest));
+    assert_eq!(next(&mut chain), id(&d));
+}
+#[test]
+fn turns_order_by_rank_then_queue_place_then_arrival() {
+    use std::{collections::BTreeMap, net::IpAddr};
+    use ting_node::mining::{Pending, turns};
+    let tx = support::tx();
+    let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
+    // Arrival order; `tried` plays no part, so it is set against the order.
+    let sources = [
+        ip("198.51.100.1"),
+        ip("2001:db8:1:2::1"),
+        ip("198.51.100.1"),
+        ip("2001:db8:1:2:ffff::"),
+        ip("203.0.113.9"),
+        None,
+        ip("203.0.113.9"),
+        ip("192.0.2.50"),
+    ];
+    let pool: Vec<Pending<'_>> = sources
+        .iter()
+        .enumerate()
+        .map(|(at, &source)| Pending {
+            id: [at as u8; 32],
+            tx: &tx,
+            bytes: 1,
+            arrived: at as u64,
+            source,
+            tried: if at == 7 { 0 } else { 100 - at as u64 },
+        })
+        .collect();
+    // Places in the queue by range: an IPv6 address counts as its /64, and
+    // the range of 192.0.2.50 has none.
+    let places = BTreeMap::from([
+        (ip("198.51.100.1"), 5),
+        (ip("2001:db8:1:2::"), 3),
+        (ip("203.0.113.9"), 3),
+        (None, 7),
+    ]);
+    // First of each range: the /64 and 203.0.113.9 (place 3, by arrival),
+    // 198.51.100.1 (5), the node's own (7), then the range with no place.
+    // Then the second of each, in the same order.
+    assert_eq!(turns(&pool, &places), vec![1, 4, 0, 5, 7, 3, 6, 2]);
+    // With no places at all, rank and arrival decide.
+    assert_eq!(turns(&pool, &BTreeMap::new()), vec![0, 1, 4, 5, 7, 2, 3, 6]);
+}
 #[test]
 fn a_transaction_a_fork_takes_back_out_stays_pooled() {
     use ting_core::vm::Candidate;
@@ -3868,4 +4373,710 @@ fn a_pending_answer_carries_one_slice_whole_and_lists_the_rest_by_size() {
     };
     assert_eq!(bytes, large[3].encode());
     assert_eq!(total, bytes.len() as u64);
+}
+/// A block pushed by the peer at `peer`, unasked, as a connection hands it
+/// to the chain.
+fn push(chain: &mut Chain, peer: &str, block: &Block) -> Result<serde_json::Value, String> {
+    chain.request_with(
+        "import",
+        json!({"peer":peer,"pushed":true}),
+        Some(block.encode()),
+    )
+}
+fn status(chain: &mut Chain) -> serde_json::Value {
+    chain.request("status", json!({})).unwrap()
+}
+/// A block on `history` with `producer` data and `votes`, mined and applied.
+fn mine_with(
+    runtime: &Runtime,
+    g: &Genesis,
+    history: &mut Vec<Header>,
+    producer: Vec<u8>,
+    votes: [u8; 4],
+) -> Block {
+    let mut b = runtime
+        .build_candidate(
+            g,
+            history,
+            vec![],
+            g.timestamp + 60 * (history.len() as u64 + 1),
+            votes,
+            producer,
+        )
+        .unwrap();
+    while !consensus::valid_pow(&b.header) {
+        b.header.nonce += 1;
+    }
+    runtime.validate_and_apply_block(g, history, &b).unwrap();
+    history.push(b.header.clone());
+    b
+}
+/// A runtime and history at the tip of `blocks`.
+fn replayed(g: &Genesis, blocks: &[Block]) -> (Runtime, Vec<Header>) {
+    let runtime = Runtime::new(State::default(), Context::from_genesis(g));
+    let mut history = vec![];
+    for block in blocks {
+        runtime
+            .validate_and_apply_block(g, &history, block)
+            .unwrap();
+        history.push(block.header.clone());
+    }
+    (runtime, history)
+}
+/// `block` again with a wrong state root, under `parent`, mined anew.
+fn forge(block: &Block, parent: Option<&Block>) -> Block {
+    let mut forged = block.clone();
+    if let Some(parent) = parent {
+        forged.header.parent = parent.header.id();
+    } else {
+        forged.header.state_root[0] ^= 1;
+    }
+    forged.header.nonce = 0;
+    while !consensus::valid_pow(&forged.header) {
+        forged.header.nonce += 1;
+    }
+    forged
+}
+#[test]
+fn pushed_side_blocks_are_held_within_bounds_and_never_stored() {
+    // Siblings of the tip cost one block of work each and need not be valid
+    // past their headers and commitments, since nothing executes them: here
+    // each carries a whole block of producer data. Pushed unasked, none is
+    // stored or indexed: each connection holds one run in memory, and all of
+    // them together 64 MiB at most.
+    let dir = Directory::new();
+    dir.config(false, "held");
+    let mut chain = open(&dir);
+    let g = chain.genesis.clone();
+    let a = branch(&g, 30, "A");
+    for block in &a {
+        chain.import(&block.encode(), true).unwrap();
+    }
+    let before = status(&mut chain);
+    let capacity = before["limits"][2].as_u64().unwrap() as usize;
+    let tip = &a[29];
+    let filler = capacity - (tip.encode().len() - tip.producer.len());
+    let sibling = |i: u64| {
+        let mut b = tip.clone();
+        b.producer = vec![0x5a; filler];
+        b.producer[..8].copy_from_slice(&i.to_le_bytes());
+        b.header.producer_hash = ting_core::protocol::producer_hash(&b.producer);
+        b.header.nonce = 0;
+        while !consensus::valid_pow(&b.header) {
+            b.header.nonce += 1;
+        }
+        assert_eq!(b.encode().len(), capacity);
+        b
+    };
+    let unchanged = |chain: &mut Chain| {
+        let now = status(chain);
+        for field in [
+            "tip",
+            "height",
+            "stored_blocks",
+            "held_headers",
+            "best_height",
+        ] {
+            assert_eq!(now[field], before[field], "{field}");
+        }
+        now
+    };
+    // One connection holds one run: each sibling begins a new one.
+    let answers: Vec<_> = (0..10)
+        .map(|i| push(&mut chain, "192.0.2.1:4000", &sibling(i)).unwrap())
+        .collect();
+    assert_eq!(unchanged(&mut chain)["held_pushed_blocks"], 1);
+    for answer in answers {
+        assert_eq!(
+            (answer["held"].clone(), answer["known"].clone()),
+            (json!(true), json!(false))
+        );
+    }
+    // Sent again, a held block is answered as known, and still not stored.
+    let again = push(&mut chain, "192.0.2.1:4000", &sibling(9)).unwrap();
+    assert_eq!(
+        (again["held"].clone(), again["known"].clone()),
+        (json!(true), json!(true))
+    );
+    // A hundred connections hold 63 blocks of 1 MiB at most, within 64 MiB.
+    for i in 0..100u64 {
+        push(
+            &mut chain,
+            &format!("192.0.2.{}:4000", i + 2),
+            &sibling(100 + i),
+        )
+        .unwrap();
+    }
+    let now = unchanged(&mut chain);
+    let (blocks, bytes) = (
+        now["held_pushed_blocks"].as_u64().unwrap(),
+        now["held_pushed_bytes"].as_u64().unwrap(),
+    );
+    assert_eq!(blocks, 63, "{now}");
+    assert!(
+        bytes <= 64 << 20 && bytes == blocks * (capacity as u64 + 1024),
+        "{now}"
+    );
+    // A run that forks deep enough to go on without overtaking the tip is
+    // held up to 16 MiB: past it, the block is refused for now, and the run
+    // goes. Pushed again from the run's last block, as a pushing node goes
+    // on from the last block taken, it is refused the same way, a policy the
+    // pusher stops at; a block after it is one whose parent nobody holds.
+    let (runtime, mut history) = replayed(&g, &a[..10]);
+    let deep: Vec<Block> = (0..17)
+        .map(|_| mine_with(&runtime, &g, &mut history, vec![0x5b; filler - 64], [0; 4]))
+        .collect();
+    let peer = "198.51.100.1:4000";
+    for block in &deep[..15] {
+        assert_eq!(push(&mut chain, peer, block).unwrap()["held"], true);
+    }
+    for _ in 0..2 {
+        assert_eq!(
+            push(&mut chain, peer, &deep[15]).unwrap_err(),
+            ting_node::chain::BEHIND
+        );
+    }
+    assert_eq!(
+        push(&mut chain, peer, &deep[16]).unwrap_err(),
+        "unknown parent"
+    );
+    let now = unchanged(&mut chain);
+    assert!(
+        now["held_pushed_bytes"].as_u64().unwrap() <= 64 << 20,
+        "{now}"
+    );
+    // Nothing was written: the block files hold the 30 blocks alone.
+    let files: u64 = fs::read_dir(dir.0.join("blocks"))
+        .unwrap()
+        .map(|f| f.unwrap().metadata().unwrap().len())
+        .sum();
+    let canonical: u64 = a.iter().map(|b| b.encode().len() as u64 + 40).sum();
+    assert!(files <= canonical + 40, "{files} bytes for {canonical}");
+}
+#[test]
+fn a_pushed_sibling_is_held_until_its_child_overtakes_and_then_connected() {
+    // A natural fork: the node holds A at height 3; a peer that mined B3 on
+    // A2 pushes it, then C4 on it, as a pushing node does, from the block
+    // they share. B3 is held, not stored; C4 makes the branch overtake the
+    // tip, and both are stored and connected at once.
+    let dir = Directory::new();
+    dir.config(false, "fork");
+    let mut chain = open(&dir);
+    let g = chain.genesis.clone();
+    let a = branch(&g, 3, "A");
+    for block in &a {
+        chain.import(&block.encode(), true).unwrap();
+    }
+    let (runtime, mut history) = replayed(&g, &a[..2]);
+    let b3 = mine(&runtime, &g, &mut history, vec![], "B");
+    let c4 = mine(&runtime, &g, &mut history, vec![], "B");
+    let (runtime, mut history) = replayed(&g, &[a[0].clone(), a[1].clone(), b3.clone()]);
+    let x4 = mine(&runtime, &g, &mut history, vec![], "X");
+    let x5 = mine(&runtime, &g, &mut history, vec![], "X");
+    let peer = "10.0.0.2:2";
+    let answer = push(&mut chain, peer, &b3).unwrap();
+    assert_eq!(status(&mut chain)["stored_blocks"], 3);
+    assert_eq!(answer["held"], true);
+    assert_eq!(chain.tip(), a[2].header.id());
+    // The connection ends: what it held goes with it, and the child alone
+    // finds no parent; pushed again from the shared block, the branch is
+    // taken.
+    chain
+        .request("release", json!({"peer":peer,"pushed":true}))
+        .unwrap();
+    assert_eq!(status(&mut chain)["held_pushed_blocks"], 0);
+    let peer = "10.0.0.2:3";
+    assert_eq!(push(&mut chain, peer, &c4).unwrap_err(), "unknown parent");
+    assert_eq!(push(&mut chain, peer, &b3).unwrap()["held"], true);
+    let answer = push(&mut chain, peer, &c4).unwrap();
+    assert_eq!(answer["canonical"], true, "{answer}");
+    assert_eq!(chain.tip(), c4.header.id());
+    let now = status(&mut chain);
+    assert_eq!(
+        (
+            now["stored_blocks"].clone(),
+            now["held_pushed_blocks"].clone()
+        ),
+        (json!(5), json!(0))
+    );
+    assert_eq!(now["reorganization"]["replaced"], 1);
+    // A run whose first block fails once connected names the peer that
+    // pushed it, and leaves the tip where it was: X4, a sibling of C4 with a
+    // wrong state root, then X5 on it.
+    let x4 = forge(&x4, None);
+    let x5 = forge(&x5, Some(&x4));
+    let liar = "10.0.0.9:9";
+    assert_eq!(push(&mut chain, liar, &x4).unwrap()["held"], true);
+    push(&mut chain, liar, &x5).unwrap();
+    assert_eq!(chain.tip(), c4.header.id());
+    let offenders = chain.request("offenders", json!({})).unwrap();
+    let named = offenders["peers"].as_array().unwrap();
+    assert!(
+        !named.is_empty() && named.iter().all(|p| p == liar),
+        "{offenders}"
+    );
+}
+#[test]
+fn side_blocks_stored_before_load_unchanged_and_are_followed() {
+    // A side block stored as every pushed block once was: the node opens on
+    // it as before, takes no new sibling onto disk, and follows the stored
+    // block's branch once a child of it overtakes the tip.
+    let dir = Directory::new();
+    dir.config(false, "restart");
+    let mut chain = open(&dir);
+    let g = chain.genesis.clone();
+    let a = branch(&g, 3, "A");
+    for block in &a {
+        chain.import(&block.encode(), true).unwrap();
+    }
+    let (runtime, mut history) = replayed(&g, &a[..2]);
+    let s3 = mine(&runtime, &g, &mut history, vec![], "S");
+    let t4 = mine(&runtime, &g, &mut history, vec![], "S");
+    chain.import(&s3.encode(), true).unwrap();
+    let before = status(&mut chain);
+    assert_eq!(before["stored_blocks"], 4);
+    drop(chain);
+    let mut chain = open(&dir);
+    let opened = status(&mut chain);
+    for field in ["tip", "stored_blocks", "held_headers", "best_height"] {
+        assert_eq!(opened[field], before[field], "{field}");
+    }
+    // A new sibling is held, not stored.
+    let (runtime, mut history) = replayed(&g, &a[..2]);
+    let j3 = mine(&runtime, &g, &mut history, vec![], "J");
+    let answer = push(&mut chain, "10.0.0.3:3", &j3).unwrap();
+    assert_eq!(status(&mut chain)["stored_blocks"], 4);
+    assert_eq!(answer["held"], true);
+    // The stored side block's child overtakes the tip: stored and connected.
+    let answer = push(&mut chain, "10.0.0.4:4", &t4).unwrap();
+    assert_eq!(answer["canonical"], true, "{answer}");
+    assert_eq!(chain.tip(), t4.header.id());
+    assert_eq!(status(&mut chain)["stored_blocks"], 5);
+    drop(chain);
+    assert_eq!(open(&dir).tip(), t4.header.id());
+}
+#[test]
+fn a_pushed_run_across_an_epoch_boundary_runs_under_the_limits_its_votes_decide() {
+    // Epochs of four blocks, every block voting every capacity up: from the
+    // third epoch on, each has other limits. A run pushed from A's block 14
+    // crosses the boundary after 16; its block 17's limits, which the votes
+    // of blocks 9 to 12 decide, are those of A's block 17, and the run
+    // connects with the limits a node that imported the branch itself has.
+    // A run from block 6 would need its own blocks' votes counted: it is
+    // refused for now at the boundary.
+    let experimental = |name: &str| {
+        let dir = Directory::new();
+        let path = dir.0.join("genesis.src");
+        fs::write(&path, Genesis::experimental().encode()).unwrap();
+        let c = config::Config {
+            name: name.into(),
+            control: "127.0.0.1:0".parse().unwrap(),
+            p2p: "127.0.0.1:0".parse().unwrap(),
+            api: "127.0.0.1:0".parse().unwrap(),
+            ..Default::default()
+        };
+        config::initialize(&dir.0, &c, Some(&path)).unwrap();
+        dir
+    };
+    let (dir, reference) = (experimental("pushed"), experimental("reference"));
+    let mut chain = open(&dir);
+    let g = chain.genesis.clone();
+    assert_eq!(g.vote_epoch, 4);
+    let up = [1; 4];
+    let (runtime, mut history) = replayed(&g, &[]);
+    let a: Vec<Block> = (0..18)
+        .map(|_| mine_with(&runtime, &g, &mut history, b"A".to_vec(), up))
+        .collect();
+    for block in &a {
+        chain.import(&block.encode(), true).unwrap();
+    }
+    let (runtime, mut history) = replayed(&g, &a[..14]);
+    let b: Vec<Block> = (0..5)
+        .map(|_| mine_with(&runtime, &g, &mut history, b"B".to_vec(), up))
+        .collect();
+    assert_ne!(
+        consensus::active_limits(&g, &history[..16]),
+        consensus::active_limits(&g, &history[..13]),
+        "the limits move at the boundary"
+    );
+    let peer = "10.0.0.5:5";
+    let stored = status(&mut chain)["stored_blocks"].clone();
+    for block in &b[..4] {
+        push(&mut chain, peer, block).unwrap();
+    }
+    assert_eq!(status(&mut chain)["stored_blocks"], stored);
+    assert_eq!(status(&mut chain)["held_pushed_blocks"], 4);
+    assert_eq!(push(&mut chain, peer, &b[4]).unwrap()["canonical"], true);
+    assert_eq!(chain.tip(), b[4].header.id());
+    let mut other = open(&reference);
+    for block in a[..14].iter().chain(&b) {
+        other.import(&block.encode(), true).unwrap();
+    }
+    let (ours, theirs) = (status(&mut chain), status(&mut other));
+    for field in ["tip", "limits", "state_root", "work"] {
+        assert_eq!(ours[field], theirs[field], "{field}");
+    }
+    assert_eq!(
+        ours["limits"],
+        json!(consensus::active_limits(&g, &history).0)
+    );
+    // From block 6, the run's block 17 would count blocks 9 to 12 of its own.
+    let (runtime, mut history) = replayed(&g, &a[..6]);
+    let deep: Vec<Block> = (0..11)
+        .map(|_| mine_with(&runtime, &g, &mut history, b"D".to_vec(), up))
+        .collect();
+    let peer = "10.0.0.6:6";
+    for block in &deep[..10] {
+        assert_eq!(push(&mut chain, peer, block).unwrap()["held"], true);
+    }
+    assert_eq!(
+        push(&mut chain, peer, &deep[10]).unwrap_err(),
+        ting_node::chain::BEHIND
+    );
+    assert_eq!(chain.tip(), b[4].header.id());
+}
+/// `header` again with other producer data and its parent `parent`, mined
+/// anew: a header of the same work on another branch.
+fn other_header(header: &Header, parent: Option<Hash>, n: u64) -> Header {
+    let mut other = header.clone();
+    if let Some(parent) = parent {
+        other.parent = parent;
+    }
+    other.producer_hash = ting_core::hash::hash("other", &n.to_le_bytes());
+    other.nonce = 0;
+    while !consensus::valid_pow(&other) {
+        other.nonce += 1;
+    }
+    other
+}
+use ting_core::hash::Hash;
+#[test]
+fn headers_that_do_not_overtake_the_best_header_leave_the_index_as_it_was() {
+    // Siblings of the tip, one block of work each, sent as headers: 4,000 of
+    // them in two pages leave the index as it was, each page checking one
+    // header. Pairs that overtake the tip by a block each, a sibling and its
+    // child: the first is indexed, as the best header now; the 99 others
+    // carry no more work than it and are not.
+    let dir = Directory::new();
+    dir.config(false, "headers");
+    let mut chain = open(&dir);
+    let g = chain.genesis.clone();
+    // Headers that extend the best header are indexed whatever their own
+    // work: stamped now, years after genesis, the difficulty eases to its
+    // limit after the first, and each later one has a quarter of its work.
+    let now = ting_node::now();
+    let (runtime, mut history) = replayed(&g, &[]);
+    let eased: Vec<Header> = (0..3)
+        .map(|i| {
+            let mut b = runtime
+                .build_candidate(&g, &history, vec![], now + i, [0; 4], vec![])
+                .unwrap();
+            while !consensus::valid_pow(&b.header) {
+                b.header.nonce += 1;
+            }
+            runtime.validate_and_apply_block(&g, &history, &b).unwrap();
+            history.push(b.header.clone());
+            b.header
+        })
+        .collect();
+    assert!(consensus::work(&eased[1].target) < consensus::work(&eased[0].target) / 2u32);
+    let fresh = Directory::new();
+    fresh.config(false, "eased");
+    assert_eq!(
+        headers_from(&mut open(&fresh), &eased).unwrap()["indexed"],
+        3
+    );
+    let a = branch(&g, 30, "A");
+    for block in &a {
+        chain.import(&block.encode(), true).unwrap();
+    }
+    let before = status(&mut chain);
+    let tip = &a[29].header;
+    let siblings: Vec<Header> = (0..4_000).map(|n| other_header(tip, None, n)).collect();
+    let started = std::time::Instant::now();
+    for page in siblings.chunks(2_000) {
+        let answer = headers_from(&mut chain, page).unwrap();
+        assert_eq!(answer["indexed"], 0, "{answer}");
+        assert_eq!(answer["next"], serde_json::Value::Null, "{answer}");
+    }
+    let took = started.elapsed();
+    let now = status(&mut chain);
+    for field in ["held_headers", "best_height", "stored_blocks", "tip"] {
+        assert_eq!(now[field], before[field], "{field}");
+    }
+    assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+    // A child of the tip, as a template for the children of its siblings:
+    // they share its target and its parent's timestamps.
+    let (runtime, mut history) = replayed(&g, &a);
+    let child = mine(&runtime, &g, &mut history, vec![], "A").header;
+    let mut indexed = 0;
+    for n in 0..100 {
+        let first = other_header(tip, None, 10_000 + n);
+        let second = other_header(&child, Some(first.id()), 20_000 + n);
+        indexed += sync_headers(&mut chain, &[first, second])["indexed"]
+            .as_u64()
+            .unwrap();
+    }
+    assert_eq!(indexed, 2);
+    let now = status(&mut chain);
+    assert_eq!(
+        now["held_headers"].as_u64().unwrap(),
+        before["held_headers"].as_u64().unwrap() + 2
+    );
+    assert_eq!(now["best_height"], 31);
+}
+#[test]
+fn a_side_header_waits_unkept_until_its_branch_overtakes_and_is_then_fetched() {
+    // A natural fork shown by headers: B3, a sibling of the tip A3, is
+    // checked and not kept; once a peer shows C4 on it, the branch is asked
+    // for again from A2, indexed, and its blocks are asked for and connect.
+    let dir = Directory::new();
+    dir.config(false, "fork headers");
+    let mut chain = open(&dir);
+    let g = chain.genesis.clone();
+    let a = branch(&g, 3, "A");
+    for block in &a {
+        chain.import(&block.encode(), true).unwrap();
+    }
+    let before = status(&mut chain);
+    let (runtime, mut history) = replayed(&g, &a[..2]);
+    let b3 = mine(&runtime, &g, &mut history, vec![], "B");
+    let c4 = mine(&runtime, &g, &mut history, vec![], "B");
+    let alone = headers_from(&mut chain, std::slice::from_ref(&b3.header)).unwrap();
+    assert_eq!(alone["indexed"], 0);
+    let now = status(&mut chain);
+    for field in ["held_headers", "best_height"] {
+        assert_eq!(now[field], before[field], "{field}");
+    }
+    let both = headers_from(&mut chain, &headers_of(&[b3.clone(), c4.clone()])).unwrap();
+    assert_eq!(
+        (both["refetch"].clone(), both["next"].clone()),
+        (json!(true), json!(hex(&a[1].header.id())))
+    );
+    let again = headers_from(&mut chain, &headers_of(&[b3.clone(), c4.clone()])).unwrap();
+    assert_eq!(again["indexed"], 2);
+    assert_eq!(status(&mut chain)["best_height"], 4);
+    let wanted = chain.request("blocks_wanted", json!({"peer":"p"})).unwrap();
+    assert_eq!(
+        wanted["ids"],
+        json!([hex(&b3.header.id()), hex(&c4.header.id())])
+    );
+    for block in [&b3, &c4] {
+        chain
+            .request("import", json!({"hex":hex(&block.encode()),"peer":"p"}))
+            .unwrap();
+    }
+    assert_eq!(chain.tip(), c4.header.id());
+}
+/// `blocks`' headers again on another branch, from `parent`, each of the same
+/// work as the one it copies.
+fn copies(blocks: &[Block], mut parent: Hash, n: u64) -> Vec<Header> {
+    blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let h = other_header(&b.header, Some(parent), n * 1_000 + i as u64);
+            parent = h.id();
+            h
+        })
+        .collect()
+}
+#[test]
+fn a_presync_indexes_a_chain_only_while_it_overtakes_the_best_header_as_it_is_now() {
+    // A peer begins a presync with a branch from A10 as heavy as the best
+    // header, waits for the honest chain to move one block, and sends one
+    // header more: that ties the best header as it is now, and nothing is
+    // fetched again or kept, round after round. A branch that did overtake
+    // the best header when its first pass ended, but no longer does when it
+    // comes again, is not indexed either. One that overtakes the best header
+    // as it is is indexed, and is the best header by its work alone.
+    let dir = Directory::new();
+    dir.config(false, "presync now");
+    let mut chain = open(&dir);
+    let g = chain.genesis.clone();
+    let a = branch(&g, 50, "A");
+    let mut honest = 40;
+    for block in &a[..honest] {
+        chain.import(&block.encode(), true).unwrap();
+    }
+    let before = status(&mut chain);
+    let fork = a[9].header.id();
+    for round in 0..3u64 {
+        let mut side = copies(&a[10..honest], fork, round);
+        assert_eq!(headers_from(&mut chain, &side).unwrap()["indexed"], 0);
+        chain.import(&a[honest].encode(), true).unwrap();
+        honest += 1;
+        let last = other_header(
+            &a[honest - 1].header,
+            Some(side.last().unwrap().id()),
+            round * 1_000 + 999,
+        );
+        let answer = headers_from(&mut chain, std::slice::from_ref(&last)).unwrap();
+        assert_eq!(
+            (answer["refetch"].clone(), answer["indexed"].clone()),
+            (json!(false), json!(0)),
+            "{answer}"
+        );
+        side.push(last);
+        assert_eq!(headers_from(&mut chain, &side).unwrap()["indexed"], 0);
+    }
+    let now = status(&mut chain);
+    assert_eq!(
+        now["held_headers"].as_u64().unwrap(),
+        before["held_headers"].as_u64().unwrap() + 3,
+        "the three honest blocks alone"
+    );
+    assert_eq!(now["best_height"], honest);
+    // One block more than the best header: fetched again, then the honest
+    // chain moves two blocks before the chain comes again.
+    let side = copies(&a[10..honest + 1], fork, 10);
+    let first = headers_from(&mut chain, &side).unwrap();
+    assert_eq!(first["refetch"], true, "{first}");
+    for block in &a[honest..honest + 2] {
+        chain.import(&block.encode(), true).unwrap();
+    }
+    honest += 2;
+    let error = headers_from(&mut chain, &side).unwrap_err();
+    assert_eq!(error, "the chain no longer overtakes the best header");
+    assert!(
+        !ting_node::chain::is_invalid(&error),
+        "held against no peer"
+    );
+    let now = status(&mut chain);
+    assert_eq!(
+        now["held_headers"].as_u64().unwrap(),
+        before["held_headers"].as_u64().unwrap() + 5
+    );
+    assert_eq!(now["best_height"], honest);
+    // A branch that overtakes the best header as it is: indexed, and the best
+    // header, with more work than the tip.
+    let side = copies(&a[10..honest + 1], fork, 20);
+    assert_eq!(sync_headers(&mut chain, &side)["indexed"], side.len());
+    let now = status(&mut chain);
+    assert_eq!(now["best_height"], honest + 1);
+    assert_eq!(now["tip"], json!(hex(&a[honest - 1].header.id())));
+}
+/// A header a connection pushes a block under in slices, checked first.
+fn check_header(chain: &mut Chain, peer: &str, block: &Block) -> Result<serde_json::Value, String> {
+    chain.request_with(
+        "check_header",
+        json!({"peer":peer}),
+        Some(block.header.encode()),
+    )
+}
+#[test]
+fn a_pusher_that_moves_within_its_held_run_goes_on_from_the_block_it_moved_from() {
+    // An honest pusher pushed B3 and B4, both held, then moved to C4, C5 and
+    // C6 on B3, and pushes from the highest block the two nodes share on its
+    // branch: B3, known as held, then C4. The run is cut back to B3 and goes
+    // on; C6 overtakes the tip, and B3 to C6 are stored and connected. The
+    // same holds for a push in slices, whose first slice's header is checked
+    // along the run: a held block is known, and the child of any is checked.
+    let dir = Directory::new();
+    dir.config(false, "within");
+    let mut chain = open(&dir);
+    let g = chain.genesis.clone();
+    let a = branch(&g, 5, "A");
+    for block in &a {
+        chain.import(&block.encode(), true).unwrap();
+    }
+    let (runtime, mut history) = replayed(&g, &a[..2]);
+    let b3 = mine(&runtime, &g, &mut history, vec![], "B");
+    let b4 = mine(&runtime, &g, &mut history, vec![], "B");
+    let (runtime, mut history) = replayed(&g, &[a[0].clone(), a[1].clone(), b3.clone()]);
+    let c4 = mine(&runtime, &g, &mut history, vec![], "C");
+    let c5 = mine(&runtime, &g, &mut history, vec![], "C");
+    let c6 = mine(&runtime, &g, &mut history, vec![], "C");
+    let peer = "10.1.1.1:1";
+    push(&mut chain, peer, &b3).unwrap();
+    push(&mut chain, peer, &b4).unwrap();
+    for block in [&b3, &b4] {
+        let checked = check_header(&mut chain, peer, block).unwrap();
+        assert_eq!(checked["known"], true, "{checked}");
+    }
+    let checked = check_header(&mut chain, peer, &c4).unwrap();
+    assert_eq!(checked["known"], false, "{checked}");
+    assert!(checked["max"].is_u64(), "{checked}");
+    assert_eq!(push(&mut chain, peer, &b3).unwrap()["known"], true);
+    for block in [&c4, &c5] {
+        assert_eq!(push(&mut chain, peer, block).unwrap()["held"], true);
+    }
+    assert_eq!(status(&mut chain)["held_pushed_blocks"], 3);
+    assert_eq!(push(&mut chain, peer, &c6).unwrap()["canonical"], true);
+    assert_eq!(chain.tip(), c6.header.id());
+    let now = status(&mut chain);
+    assert_eq!(now["stored_blocks"], 9);
+    assert_eq!(now["held_pushed_blocks"], 0);
+}
+#[test]
+fn a_run_let_go_to_make_room_has_its_pusher_push_it_again() {
+    // The largest run of another connection gives way when all runs reach
+    // 64 MiB, so runs a little smaller than an honest one, from many
+    // connections, can take its place: here the honest miner's nearly full
+    // B, a sibling of the tip, then C on it. C is then answered, not as a
+    // block whose parent is unknown, but with what makes the pusher end its
+    // connection and, connected again, push its branch once more from the
+    // block both nodes hold; and that is taken. Policy and invalid data it is
+    // not. The child of a run let go past its bound is refused as policy.
+    let dir = Directory::new();
+    dir.config(false, "let go");
+    let mut chain = open(&dir);
+    let g = chain.genesis.clone();
+    let a = branch(&g, 30, "A");
+    for block in &a {
+        chain.import(&block.encode(), true).unwrap();
+    }
+    let capacity = status(&mut chain)["limits"][2].as_u64().unwrap() as usize;
+    let tip = &a[29];
+    let base = tip.encode().len() - tip.producer.len();
+    let sibling = |i: u64, size: usize| {
+        let mut b = tip.clone();
+        b.producer = vec![0x5a; size - base];
+        b.producer[..8].copy_from_slice(&i.to_le_bytes());
+        b.header.producer_hash = ting_core::protocol::producer_hash(&b.producer);
+        b.header.nonce = 0;
+        while !consensus::valid_pow(&b.header) {
+            b.header.nonce += 1;
+        }
+        b
+    };
+    let (runtime, mut history) = replayed(&g, &a[..29]);
+    let mut b = runtime
+        .build_candidate(
+            &g,
+            &history,
+            vec![],
+            tip.header.timestamp,
+            [0; 4],
+            vec![0x42; capacity - base - 64],
+        )
+        .unwrap();
+    while !consensus::valid_pow(&b.header) {
+        b.header.nonce += 1;
+    }
+    runtime.validate_and_apply_block(&g, &history, &b).unwrap();
+    history.push(b.header.clone());
+    let c = mine(&runtime, &g, &mut history, vec![], "B");
+    let honest = "203.0.113.7:9000";
+    assert_eq!(push(&mut chain, honest, &b).unwrap()["held"], true);
+    for i in 0..64u64 {
+        let peer = format!("198.18.{}.{}:4000", i / 8, i % 8);
+        push(&mut chain, &peer, &sibling(100 + i, capacity - 4096)).unwrap();
+    }
+    let error = push(&mut chain, honest, &c).unwrap_err();
+    assert_eq!(error, ting_node::chain::LET_GO);
+    assert!(!ting_node::chain::is_policy(&error) && !ting_node::chain::is_invalid(&error));
+    assert_eq!(
+        check_header(&mut chain, honest, &c).unwrap_err(),
+        ting_node::chain::LET_GO
+    );
+    assert_eq!(chain.tip(), tip.header.id());
+    // Connected again, the pusher pushes B and C once more: taken.
+    chain
+        .request("release", json!({"peer":honest,"pushed":true}))
+        .unwrap();
+    let again = "203.0.113.7:9001";
+    assert_eq!(push(&mut chain, again, &b).unwrap()["held"], true);
+    assert_eq!(push(&mut chain, again, &c).unwrap()["canonical"], true);
+    assert_eq!(chain.tip(), c.header.id());
 }

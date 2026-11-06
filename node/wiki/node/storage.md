@@ -130,7 +130,12 @@ sets the window in blocks; `0` keeps everything.
 - **Header.** Checked and in the header tree, in memory only
   ([headers first](sync.md#headers-first)).
 - **Stored.** The body is in a block file and matches its header, but has not been
-  executed. Its location, header and work are in the database.
+  executed. Its location, header and work are in the database. A body is stored when
+  the node asked for it along the best header's branch, or when a peer pushed it and
+  it is executed at once; a pushed block whose branch does not overtake the tip is
+  only held in memory ([pushed blocks](sync.md#pushed-blocks)). Block files are only
+  ever appended to, so what a peer can make a node write is what the node either
+  asked for or executes.
 - **Valid.** Executed on its branch, with its record changes kept. Only valid blocks
   are ever connected.
 - **Invalid.** Its execution failed, or the operator marked it invalid, or it sits
@@ -143,8 +148,10 @@ sets the window in blocks; `0` keeps everything.
 The node keeps an index of the blocks it knows: for each, its header, its
 accumulated work, the limits it runs under and what the node holds of it. Choosing,
 downloading and connecting the best branch work from it. The index holds in memory
-the most recent canonical blocks, every side branch, and the headers whose blocks are
-not stored yet. Canonical blocks further down are **settled**: the index reads them
+the most recent canonical blocks, every stored side branch, and the headers whose
+blocks are not stored yet, which headers sync indexes only for a chain that overtook
+the best header ([headers first](sync.md#headers-first)). Canonical blocks further
+down are **settled**: the index reads them
 from the database when it needs them, their header and work from `headers` and
 their limits from `block_limits`. Its memory therefore does not grow with the length
 of the chain.
@@ -175,8 +182,9 @@ events, and any undo and redo data. Their frames stay in the block files,
 unreferenced, as the files are only ever appended to. Should such a branch ever be
 extended past the tip, it is fetched again like any other branch.
 
-The node's status shows `settled_height`, the height at or below which canonical
-blocks are settled, and `held_headers`, the index entries in memory.
+The node's status, `ting status --json` or `GET /v1/status`, shows `settled_height`,
+the height at or below which canonical blocks are settled, and `held_headers`, the
+index entries in memory.
 
 ## Connecting the best branch
 
@@ -220,13 +228,15 @@ waits for confirmations may want to look.
 
 ## Deep reorganizations
 
-A branch that forks below the window needs undo data the node no longer has. The
-node then stays on its tip and, in the background, replays its canonical blocks
-from genesis into a temporary database next to its own, from block files alone,
-checking every state root on the way. It keeps the undo data of each block between
-the fork and the window as the replay passes it, copies it into its database a step
-at a time, and carries out the reorganization as any other. There is no depth limit:
-the deeper the fork, the longer the replay, never a refusal. A restart during the
+A branch that forks below the window needs undo data the node no longer has, and so
+does one that forks below where the node pruned it while its tip stood higher, as
+before a reorganization: undo data once pruned stays pruned. The node then stays on
+its tip and, in the background, replays its canonical blocks from genesis into a
+temporary database next to its own, from block files alone, checking every state
+root on the way. It keeps the undo data of each block between the fork and the
+window as the replay passes it, copies it into its database a step at a time, and
+carries out the reorganization as any other. There is no depth limit: the deeper the
+fork, the longer the replay, never a refusal. A restart during the
 replay starts it again.
 
 The temporary database holds a second copy of the state until the replay ends, so a

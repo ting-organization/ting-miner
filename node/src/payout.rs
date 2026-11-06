@@ -89,24 +89,29 @@ impl Policy {
 /// it claims and values Daler.
 pub const PRODUCTION_POLICY: &str = include_str!("../../miner.production.json");
 /// Gives `dir`, a new data directory of the production network, the production
-/// policy as its `miner.json`, unless it has one (`ting init`). A ContractId
-/// belongs to one chain, so a node of another network starts without one.
-pub fn initialize(dir: &Path) -> Result<()> {
+/// policy as its `miner.json`, unless it has one (`ting init`), and says
+/// whether it wrote it. A ContractId belongs to one chain, so a node of another
+/// network starts without one.
+pub fn initialize(dir: &Path) -> Result<bool> {
     let path = dir.join(POLICY_FILE);
     match OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(mut file) => {
             file.write_all(PRODUCTION_POLICY.as_bytes())
                 .and_then(|()| file.sync_all())
                 .map_err(|e| format!("cannot write {POLICY_FILE}: {e}"))?;
-            eprintln!(
-                "wrote {}: the production policy, mining Daler",
-                path.display()
-            );
-            Ok(())
+            Ok(true)
         }
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(false),
         Err(e) => Err(format!("cannot write {POLICY_FILE}: {e}")),
     }
+}
+/// The lines `ting init` adds once it wrote the production policy; `ting` is
+/// the command as the person typed it.
+pub fn initialized(ting: &str) -> String {
+    format!(
+        "\nIts {POLICY_FILE} mines Daler (DLR). Name the account the blocks pay with:\n  \
+         {ting} miner payout <account>\n"
+    )
 }
 
 /// The selector of a paid miner.
@@ -387,6 +392,32 @@ pub fn with_payout(mut answer: Value) -> Value {
         .unwrap_or_default();
     answer["payout"] = json!(payout_account(&producer).map(|account| hex(&account)));
     answer
+}
+/// The account an answer of [`with_payout`] names, as `ting miner status`
+/// shows it.
+pub fn account_text(payout: &Value) -> String {
+    match payout.as_str() {
+        Some(account) => account.to_owned(),
+        None => "none: the blocks claim nothing and pay nobody".to_owned(),
+    }
+}
+/// The text of `ting miner payout`: the account the blocks pay, and, after
+/// setting it, whether the running node took it (`saved` false) or the node
+/// was stopped and config.json holds it.
+pub fn payout_text(answer: &Value, saved: Option<bool>, ting: &str) -> String {
+    match (answer["payout"].as_str(), saved) {
+        (Some(account), Some(true)) => {
+            format!("Saved in config.json: the blocks this node builds pay {account}.\n")
+        }
+        (Some(account), Some(false)) => {
+            format!("The blocks this node builds pay {account}, from its next template.\n")
+        }
+        (Some(account), None) => format!("The blocks this node builds pay {account}.\n"),
+        (None, _) => format!(
+            "The blocks this node builds pay no account, so they claim nothing.\n\
+             Name one with: {ting} miner payout <account>\n"
+        ),
+    }
 }
 /// A transaction's share of the block: its largest fraction of any capacity.
 fn share(used: &Resources, limits: &Resources) -> f64 {

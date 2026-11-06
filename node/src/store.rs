@@ -1352,7 +1352,7 @@ impl Store {
         // such as one a power loss left zero-filled, ends it, and its block
         // and any after it are fetched again (wiki: node/storage).
         let truncate = |file: &mut std::fs::File| -> Result<Option<Vec<u8>>> {
-            eprintln!("block file: a damaged unindexed frame at {offset} is truncated");
+            crate::log!("block file: a damaged unindexed frame at {offset} is truncated");
             file.set_len(offset)
                 .and_then(|()| file.sync_all())
                 .map_err(err)?;
@@ -1967,13 +1967,18 @@ impl View<'_> {
         }))
     }
     /// Whether a canonical block above `height` includes the transaction with
-    /// a successful receipt.
+    /// a successful receipt. A block is read once however often it includes
+    /// the transaction: its occurrences come one after another.
     pub fn succeeded_above(&self, id: Hash, height: u64) -> Result<bool> {
+        let mut read = None;
+        let mut receipts = Vec::new();
         for found in self.canonical_occurrences(id, Some(height))? {
             let (block, index) = found?;
-            if self
-                .block(&block)?
-                .receipts
+            if read != Some(block) {
+                receipts = self.block(&block)?.receipts;
+                read = Some(block);
+            }
+            if receipts
                 .get(index)
                 .is_some_and(|r| r.status == ting_core::protocol::Status::Success)
             {
