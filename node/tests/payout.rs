@@ -411,6 +411,52 @@ fn a_full_pool_lets_the_lowest_payment_give_way() {
     );
 }
 
+/// The addresses of one IPv6 /64 count as one range, as Ting's shares do: a
+/// fresh address in it pushes out no other range's payment beyond the range's
+/// equal share, while another /64 can.
+#[test]
+fn a_full_pool_counts_an_ipv6_64_as_one_range() {
+    use std::net::IpAddr;
+    let me = [7; 32];
+    let (_dir, mut chain, program, chain_id) = paid_miner(payer(), true, 3);
+    let address = |a: &str| -> IpAddr { a.parse().unwrap() };
+    let pooled = |chain: &mut Chain, tx: &Transaction| {
+        chain
+            .request("transaction", json!({"id":hex(&tx.id(chain_id))}))
+            .is_ok()
+    };
+    // Another range's payment of 10, then two of one /64, each from its own
+    // address.
+    let ten = pay(program, &me, 10);
+    chain
+        .submit_from(&ten.encode(), Some(address("10.0.0.1")))
+        .unwrap();
+    let range: Vec<Transaction> = [20, 30].map(|n| pay(program, &me, n)).to_vec();
+    for (tx, from) in range.iter().zip(["2001:db8::1", "2001:db8::2"]) {
+        chain
+            .submit_from(&tx.encode(), Some(address(from)))
+            .unwrap();
+    }
+    // A third address of the /64 pays 15, more than the 10: its range already
+    // holds more than the 10's, so the 10 stays, and none of its own pays less.
+    let fifteen = pay(program, &me, 15);
+    assert_eq!(
+        chain
+            .submit_from(&fifteen.encode(), Some(address("2001:db8::3")))
+            .unwrap_err(),
+        ting_node::chain::POOL_FULL
+    );
+    for tx in [&ten, &range[0], &range[1]] {
+        assert!(pooled(&mut chain, tx));
+    }
+    // The next /64 holds nothing yet: its 15 takes the place of the 10.
+    chain
+        .submit_from(&fifteen.encode(), Some(address("2001:db8:0:1::1")))
+        .unwrap();
+    assert!(!pooled(&mut chain, &ten));
+    assert!(pooled(&mut chain, &fifteen));
+}
+
 #[test]
 fn an_account_as_a_wallet_shows_it_becomes_producer_data_paying_it() {
     let account = "0123456789ABCDEF".repeat(4);
@@ -452,14 +498,19 @@ fn ting(dir: &Directory, args: &[&str]) -> std::process::Output {
     }
     command.output().unwrap()
 }
+/// A command's result, printed as JSON.
 fn answer(dir: &Directory, args: &[&str]) -> serde_json::Value {
+    serde_json::from_str(&text(dir, &[&["--json"], args].concat())).unwrap()
+}
+/// A command's text, as a person reads it.
+fn text(dir: &Directory, args: &[&str]) -> String {
     let output = ting(dir, args);
     assert!(
         output.status.success(),
         "{args:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    serde_json::from_slice(&output.stdout).unwrap()
+    String::from_utf8(output.stdout).unwrap()
 }
 /// Stops the node of a test that started one, however the test ends.
 struct Stop<'a>(&'a Directory);
@@ -490,6 +541,19 @@ fn the_payout_command_sets_the_account_the_blocks_pay_and_shows_it() {
         answer(&dir, &["miner", "payout"])["payout"],
         json!(first.to_lowercase())
     );
+    // As text: the account, and where it went.
+    let pays = |account: &str| format!("the blocks this node builds pay {account}");
+    let saved = text(&dir, &["miner", "payout", &first]);
+    assert!(saved.starts_with("Saved in config.json"), "{saved}");
+    assert!(saved.contains(&pays(&first.to_lowercase())), "{saved}");
+    let shown = text(&dir, &["miner", "payout"]);
+    assert_eq!(
+        shown,
+        format!(
+            "The blocks this node builds pay {}.\n",
+            first.to_lowercase()
+        )
+    );
 
     answer(&dir, &["start"]);
     let _stop = Stop(&dir);
@@ -500,10 +564,27 @@ fn the_payout_command_sets_the_account_the_blocks_pay_and_shows_it() {
     let status = answer(&dir, &["miner", "status"]);
     assert_eq!(status["payout"], json!(second));
     assert_eq!(status["producer_hex"], json!(paying(&second)));
+    let set = text(&dir, &["miner", "payout", &second]);
+    assert!(set.contains("from its next template"), "{set}");
+    let status = text(&dir, &["miner", "status"]);
+    assert!(
+        status
+            .lines()
+            .any(|line| line.starts_with("Payout") && line.ends_with(&format!("  {second}"))),
+        "{status}"
+    );
     // Producer data naming no payout account pays nobody.
     answer(&dir, &["miner", "producer", "4f435031"]);
     assert_eq!(answer(&dir, &["miner", "status"])["payout"], json!(null));
     assert_eq!(answer(&dir, &["miner", "payout"])["payout"], json!(null));
+    let none = text(&dir, &["miner", "payout"]);
+    assert!(none.contains("pay no account"), "{none}");
+    assert!(none.contains("miner payout <account>"), "{none}");
+    let status = text(&dir, &["miner", "status"]);
+    assert!(
+        status.contains("none: the blocks claim nothing"),
+        "{status}"
+    );
 }
 
 /// `ting init` gives a production node the production policy, claiming and
@@ -513,7 +594,12 @@ fn the_payout_command_sets_the_account_the_blocks_pay_and_shows_it() {
 fn a_new_production_node_mines_daler_and_another_network_nothing() {
     let daler = "305378d17f6af84a563d0f8a8455084948aff7330b62b4f2f98a44b82ba113c4";
     let production = Directory::new();
-    answer(&production, &["init"]);
+    let created = text(&production, &["init"]);
+    assert!(
+        created.contains("miner.json mines Daler (DLR)"),
+        "{created}"
+    );
+    assert!(created.contains("miner payout <account>"), "{created}");
     let written = std::fs::read_to_string(production.0.join("miner.json")).unwrap();
     assert_eq!(written, payout::PRODUCTION_POLICY);
     let policy = Policy::load(&production.0).unwrap();
@@ -522,13 +608,14 @@ fn a_new_production_node_mines_daler_and_another_network_nothing() {
     assert!(policy.unpaid);
 
     let development = Directory::new();
-    answer(&development, &["init", "--dev"]);
+    let created = text(&development, &["init", "--dev"]);
+    assert!(!created.contains("miner.json"), "{created}");
     assert!(!development.0.join("miner.json").exists());
     assert!(Policy::load(&development.0).unwrap().claims.is_empty());
 
     let own = r#"{"assets":{},"claims":[]}"#;
     std::fs::write(production.0.join("miner.json"), own).unwrap();
-    payout::initialize(&production.0).unwrap();
+    assert!(!payout::initialize(&production.0).unwrap());
     let kept = std::fs::read_to_string(production.0.join("miner.json")).unwrap();
     assert_eq!(kept, own);
 }

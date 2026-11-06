@@ -9,6 +9,7 @@
 use crate::{
     Result,
     daemon::Mining,
+    discovery,
     mining::{FirstIn, Pending, Selector, fair_share},
     search::{self, Choice},
 };
@@ -89,24 +90,29 @@ impl Policy {
 /// it claims and values Daler.
 pub const PRODUCTION_POLICY: &str = include_str!("../../miner.production.json");
 /// Gives `dir`, a new data directory of the production network, the production
-/// policy as its `miner.json`, unless it has one (`ting init`). A ContractId
-/// belongs to one chain, so a node of another network starts without one.
-pub fn initialize(dir: &Path) -> Result<()> {
+/// policy as its `miner.json`, unless it has one (`ting init`), and says
+/// whether it wrote it. A ContractId belongs to one chain, so a node of another
+/// network starts without one.
+pub fn initialize(dir: &Path) -> Result<bool> {
     let path = dir.join(POLICY_FILE);
     match OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(mut file) => {
             file.write_all(PRODUCTION_POLICY.as_bytes())
                 .and_then(|()| file.sync_all())
                 .map_err(|e| format!("cannot write {POLICY_FILE}: {e}"))?;
-            eprintln!(
-                "wrote {}: the production policy, mining Daler",
-                path.display()
-            );
-            Ok(())
+            Ok(true)
         }
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(false),
         Err(e) => Err(format!("cannot write {POLICY_FILE}: {e}")),
     }
+}
+/// The lines `ting init` adds once it wrote the production policy; `ting` is
+/// the command as the person typed it.
+pub fn initialized(ting: &str) -> String {
+    format!(
+        "\nIts {POLICY_FILE} mines Daler (DLR). Name the account the blocks pay with:\n  \
+         {ting} miner payout <account>\n"
+    )
 }
 
 /// The selector of a paid miner.
@@ -274,14 +280,16 @@ impl Selector for Payout {
         }
     }
     /// In a full pool, the transaction that pays least per share of the block
-    /// gives way, if it pays less than the newcomer, among those of addresses
-    /// holding at least as many as the newcomer's: so an address cannot push
-    /// out others' transactions with ones of its own that will fail, beyond an
-    /// equal share. Among equals the most recent gives way. When none pays
-    /// less, the reference rule decides, but never against a transaction that
-    /// pays more than the newcomer. The node's own submissions never give way,
-    /// and neither does one whose rank is unknown; a newcomer's unknown rank
-    /// counts as paying nothing.
+    /// gives way, if it pays less than the newcomer, among those of address
+    /// ranges holding at least as many as the newcomer's: so a range cannot
+    /// push out others' transactions with ones of its own that will fail,
+    /// beyond an equal share. A range is an IPv4 address or an IPv6 /64, as
+    /// Ting's shares count (`discovery::range`), so the many addresses of one
+    /// /64 hold one share between them. Among equals the most recent gives
+    /// way. When none pays less, the reference rule decides, but never against
+    /// a transaction that pays more than the newcomer. The node's own
+    /// submissions never give way, and neither does one whose rank is unknown;
+    /// a newcomer's unknown rank counts as paying nothing.
     fn give_way(
         &mut self,
         pool: &[Pending<'_>],
@@ -292,19 +300,19 @@ impl Selector for Payout {
             return fair_share(pool, incoming);
         };
         let offered = self.rank(incoming, &payee, block).unwrap_or(0.0);
+        let range = |pending: &Pending<'_>| pending.source.map(discovery::range);
         let mut held: HashMap<IpAddr, usize> = HashMap::new();
         for pending in pool {
-            if let Some(source) = pending.source {
+            if let Some(source) = range(pending) {
                 *held.entry(source).or_default() += 1;
             }
         }
-        let own = incoming
-            .source
+        let own = range(incoming)
             .and_then(|source| held.get(&source).copied())
             .unwrap_or(0);
         let mut lowest: Option<(f64, usize)> = None;
         for (i, pending) in pool.iter().enumerate() {
-            let Some(source) = pending.source else {
+            let Some(source) = range(pending) else {
                 continue;
             };
             if held[&source] < own {
@@ -387,6 +395,32 @@ pub fn with_payout(mut answer: Value) -> Value {
         .unwrap_or_default();
     answer["payout"] = json!(payout_account(&producer).map(|account| hex(&account)));
     answer
+}
+/// The account an answer of [`with_payout`] names, as `ting miner status`
+/// shows it.
+pub fn account_text(payout: &Value) -> String {
+    match payout.as_str() {
+        Some(account) => account.to_owned(),
+        None => "none: the blocks claim nothing and pay nobody".to_owned(),
+    }
+}
+/// The text of `ting miner payout`: the account the blocks pay, and, after
+/// setting it, whether the running node took it (`saved` false) or the node
+/// was stopped and config.json holds it.
+pub fn payout_text(answer: &Value, saved: Option<bool>, ting: &str) -> String {
+    match (answer["payout"].as_str(), saved) {
+        (Some(account), Some(true)) => {
+            format!("Saved in config.json: the blocks this node builds pay {account}.\n")
+        }
+        (Some(account), Some(false)) => {
+            format!("The blocks this node builds pay {account}, from its next template.\n")
+        }
+        (Some(account), None) => format!("The blocks this node builds pay {account}.\n"),
+        (None, _) => format!(
+            "The blocks this node builds pay no account, so they claim nothing.\n\
+             Name one with: {ting} miner payout <account>\n"
+        ),
+    }
 }
 /// A transaction's share of the block: its largest fraction of any capacity.
 fn share(used: &Resources, limits: &Resources) -> f64 {

@@ -15,8 +15,10 @@ In outline:
 - It learns of blocks from their headers, checks each header as it arrives, and
   fetches bodies only along the branch of the best header
   ([headers first](#headers-first), [blocks](#blocks)).
-- It stores a body once it matches its header, and executes it only when its branch
-  is connected ([storage](storage.md#connecting-the-best-branch)).
+- It stores a body it asked for once it matches its header, and executes it only
+  when its branch is connected ([storage](storage.md#connecting-the-best-branch)). A
+  block a peer pushes unasked is stored only when it is executed at once
+  ([pushed blocks](#pushed-blocks)).
 - Over the same connections it pushes its own new blocks, exchanges pending and
   deferred transactions and, with discovery on, peer addresses
   ([finding more peers](#finding-more-peers)).
@@ -75,7 +77,14 @@ tip changes, and the node follows:
      tip has moved, since a block makes room, at most the next block's data
      capacity of them each way at each tip: no more than a block can have freed.
      A transaction larger than one 1 MiB slice travels in slices both ways
-     ([transactions in slices](#transactions-in-slices)).
+     ([transactions in slices](#transactions-in-slices)). A connection exchanges
+     at most once in two seconds, and up to a second more at random, so that the
+     node's connections do not exchange in step: each exchange lists the peer's
+     pool and deferred set, up to five pages of 32 KiB, and pools may change many
+     times a second. A change after a quiet while is exchanged at once, so a new
+     transaction waits at most about three seconds at each connection, well
+     within a block's minute, as Bitcoin announces transactions to an outbound
+     peer about every two seconds.
    - **Addresses**, with discovery on: it asks for `addresses` and adds what it
      receives to its address book, every ten seconds while it has fewer peers than it
      wants, otherwise every ten minutes.
@@ -104,17 +113,19 @@ peers](#finding-more-peers)).
 
 **Failures.** A connection whose request fails, or gets no reply within 30 seconds,
 ends. The blocks it was asked for go back to the other connections, and `ting peers`
-shows each peer's last success, or its last attempt and error. A configured peer is
+shows each peer's last success, or its last attempt and error; the node's log says
+why the connection ended ([what the node writes](../start/node.md#what-the-node-writes)). A configured peer is
 connected again a minute after the failed attempt; a discovered one waits a minute,
 doubling with each further failure up to an hour, and is replaced meanwhile.
 
 **Refusals.** A refusal that is one node's policy is not a failure, and the
 connection stays open past it:
 
-- A block on a branch more than a day's work behind the tip, whose header the node
-  has not indexed, is answered with `branch too far behind the tip` and neither
-  stored nor executed ([headers first](#headers-first)). The pushing node stops
-  pushing.
+- A pushed block the node does not take now is answered with `branch too far behind
+  the tip` and neither stored nor executed: one on a branch more than a day's work
+  behind the tip whose header the node has not indexed, one whose branch the node
+  does not store whole, and one past what a connection holds unstored
+  ([pushed blocks](#pushed-blocks)). The pushing node stops pushing.
 - A block whose timestamp is more than 7,200 seconds ahead of the receiving node's
   clock is answered with `timestamp ahead of the clock` and not stored, as
   [Time and difficulty](../consensus/difficulty.md#timestamps) asks. The pushing
@@ -142,27 +153,45 @@ Every header is checked as it arrives, against its parent: proof of work, the
 difficulty target, the timestamp rules and the clock, the votes and the capacity
 limits of its branch. What happens next depends on the work its chain carries:
 
-- **Within a day's work of the tip**, that is, short of the tip's work by at most
-  the work of 1,440 blocks at the tip's target, the header goes into the node's
-  header tree, held in memory until its block settles
+- **More than the best header's** by the [fork-choice
+  margin](../consensus/proof-of-work.md), half the work of the header's own block,
+  as a chain that extends the best header does whatever its difficulty: the header
+  goes into the node's header tree, held in memory until its block settles
   ([the block index](storage.md#the-block-index)).
-- **Further behind**, its chain is checked by a *presync* for that peer instead. The
-  headers keep streaming in and are checked one by one, but none is kept: the node
-  holds only the running state a check needs (the last header, the last eleven
-  timestamps, the work so far and the vote tallies of the last voting epochs) and,
-  every 600 headers, one bit of a salted hash of the header. When the chain reaches
-  the threshold, the node asks the peer for the same headers again from where the
-  chain forked, checks them again, compares the kept bits, and indexes them, 14,400
-  at a time, once enough bits have matched. A peer that sends a different chain the
+- **Any less**, as a sibling of the best header or a branch forked further back
+  that has not caught up, its chain is checked by a *presync* for that peer
+  instead. The headers keep streaming in and are checked one by one, but none is
+  kept: the node holds only the running state a check needs (the last header, the
+  last eleven timestamps, the work so far and the vote tallies of the last voting
+  epochs) and, every 600 headers, one bit of a salted hash of the header. When the
+  chain overtakes the best header as it is when that header arrives, the node asks
+  the peer for the same headers again from where the chain forked, checks them
+  again, compares the kept bits, and indexes them, 14,400 at a time, once enough
+  bits have matched, each time only if the whole chain still overtakes the best
+  header as it is then: one that the best header has passed meanwhile is dropped,
+  and checked again if it comes again. A peer that sends a different chain the
   second time is caught by a bit that does not match.
 
-A chain from far back, such as one forked near genesis and kept at the easiest
-difficulty, can be made cheaply, header by header. Presync lets a node check such a
-chain at the cost of the headers' checks alone, without its memory growing with the
-chain: what a presync keeps grows with the time since the fork, never with the
-number of headers, and the clock bounds the headers it accepts at six a second of
-that time. A real competing chain, however long, is indexed once it shows its work,
-so there is no depth limit and no checkpoint.
+Proof of work bounds what a header costs, not how many alternatives to one block
+there are: every child of one block has the same target, so each sibling of the best
+header costs one block of work, and a chain forked near genesis at the easiest
+difficulty is cheaper still. Only a chain that would replace the best branch is
+kept; any other is checked at the cost of the headers' checks alone, without the
+node's memory growing with it: what a presync keeps grows with the time since the
+fork, never with the number of headers, and the clock bounds the headers it accepts
+at six a second of that time. A chain kept costs half a block of work more than the
+best header each time, and the headers it adds ahead of the network's schedule grow
+harder by the [difficulty rule](../consensus/difficulty.md#the-retarget). A page of
+headers is one chain, so it begins at most one presync: a header that does not
+follow the one the page began ends the page, and a page that repeats such a header,
+or lists siblings one after another, costs no more than one that holds it once.
+
+A natural fork thus costs one more exchange: a sibling of the tip is checked and not
+kept, and once its peer shows a block on it, its branch is asked for again from where
+it forked, indexed, and its blocks fetched. A real competing chain, however long, is
+indexed once it shows its work, so there is no depth limit and no checkpoint, and a
+chain not kept is shown again by its peer at its next announcement, or within 30
+seconds.
 
 A `headers` answer starts after the highest locator entry on the answering node's
 canonical branch, wherever that entry sits in the list, so two nodes on competing
@@ -200,16 +229,81 @@ it may span: for a block, its size once the first slice tells it, and until then
 data capacity at its height. Size alone therefore never makes a download fail; a
 peer that delivers less than a slice every ten seconds or so does.
 
-A body is stored once its transaction and receipt roots, its receipt count and its
-producer data commitment match its header, and before anything is executed. Blocks
-arrive out of order and wait on disk until their parents are there. Executing them
-happens only when their branch is connected, as
-[storage](storage.md#connecting-the-best-branch) describes, so a competing
-branch costs nothing to execute until it is the heaviest.
+A body the node asked for is stored once its transaction and receipt roots, its
+receipt count and its producer data commitment match its header, and before anything
+is executed, as Bitcoin stores the blocks it requests. Blocks arrive out of order and
+wait on disk until their parents are there. Executing them happens only when their
+branch is connected, as [storage](storage.md#connecting-the-best-branch) describes,
+so a competing branch costs nothing to execute until it is the heaviest.
 
-A block pushed by a peer, or offered to the API, is taken on the same terms: its
-header must be within a day's work of the tip, or already indexed. A block from
-further behind is answered with `branch too far behind the tip`.
+### Pushed blocks
+
+A block a peer pushes, unasked, is checked as any block is, its header and its body,
+but stored only when it is executed at once: when the node stores its whole branch
+and, with it, the branch carries more work than the tip by the
+[fork-choice margin](../consensus/proof-of-work.md). It is then connected, or found
+invalid and held against the peer. Every child of one block has one target, so a
+sibling of the tip costs a block's work and no more, whatever its body holds, and
+nothing executes it: stored, such blocks would fill a node's disk at the pace of the
+pusher's hashing.
+
+Any other pushed block whose parent the node stores with its whole branch, a sibling
+of the tip for one, is held in memory instead, and answered as taken. Neither its
+header nor its body is kept. A connection holds one run of such blocks, each the
+child of the one before, the next checked against the ones held; the block that
+makes the run overtake the tip stores the whole run and connects it at once. Before
+anything is stored, each block's header is checked again from its parent as any
+block's is, and the run is stored only if that finds the work and capacities it was
+held with; were the two checks to disagree, a fault of the node, the run would be
+refused for now and nothing held against the peer. A block whose parent is a held
+block other than the run's last, as from a pusher that moved to another branch within
+the run, cuts the run back to that block and goes on from there; a block the run
+holds already is answered as known, whole or by the header of its first slice; and a
+block that follows no held block begins a new run in its place. So a natural fork
+ends as soon as it can: a miner that mined B on the tip's parent and then C on B
+pushes both from the block the nodes share, as a pushing node does, and the node
+moves to C when C arrives.
+
+A run holds up to 16 MiB, each block counted with 1 KiB more for what is kept beside
+it: 64 blocks at the production network's data capacity, two pushes of 32, and more
+blocks of today's few hundred bytes than a branch within a day's work of the tip has
+before it overtakes it. All runs together hold 64 MiB at most; past that, the largest
+run of another connection gives way. Runs a little smaller than an honest one, from
+many connections, can so make it give way; the next block of a run let go is then
+answered with `the blocks this connection pushed were let go to make room; push them
+again from the block both nodes hold`. That is no policy refusal: the pushing node
+ends its connection and, connected again, pushes its branch once more from the block
+the two share, which is how a peer that only connects to this node gets its blocks
+here. A sender that keeps adding runs from fresh connections can make that happen
+again after every reconnection, a block of work each time, so pushing alone does not
+promise that an honest branch arrives: headers sync from any followed peer that has
+the branch still brings it in. A run goes when its connection ends, and a pushed
+block is not taken once its connection has stopped waiting for the answer, as after
+the node took too long to give one, so that no run outlives its connection. The node's
+status shows what the runs hold, as `held_pushed_blocks` and `held_pushed_bytes`. A
+held block does not count as one the peer delivered, for its place among inbound
+connections ([limits](#limits)). Each of these is answered with `branch too far behind
+the tip`, holds nothing against the peer, and stops the pushing node:
+
+- a block that would take a run past 16 MiB, and the run with it, and the same block
+  pushed again from the run's last block, as the pushing node does next: such a
+  branch, pushed whole once more, would be let go again, and comes by its headers;
+- a block whose parent the node holds only as a header, or without its whole branch,
+  such as one ahead of a download: it comes along the best header's branch;
+- at the first block of a voting epoch, whose capacities the votes of an earlier
+  epoch decide, the child of a held run that does not fork from the canonical branch
+  above that epoch: only then are its limits those of the canonical block at the same
+  height, with no held block counted.
+
+What a node does not keep is not lost: a branch that later carries more work comes
+again, by its headers from the peers the node follows
+([headers first](#headers-first)), or pushed again from the block the two nodes
+share, as after a reconnection. A pushed block whose parent is neither indexed, nor
+held for its connection, nor the last block of a run its connection had let go, is
+answered with `unknown parent`, and one from more
+than a day's work behind the tip with `branch too far behind the tip`. A pushed
+block's header joins the header tree only with its body, once the block is stored,
+so one whose body fails leaves no header behind for the node to download toward.
 
 A peer pushes a block larger than one slice in slices, one item at a time on a
 connection. The slice at offset 0 holds the header, which is checked first: a block
@@ -253,7 +347,9 @@ The peer that sent invalid data is also banned for a day, with its address range
 its IPv4 address, or the /64 of its IPv6 address, which one subscriber usually holds
 whole. While the ban lasts:
 
-- addresses in the range leave the address book and are not learned again;
+- addresses in the range leave the address book and are not learned again, except
+  a seed node's, which is not connected while the ban lasts and is connected as
+  before once it ends, so that a ban never costs a node its way back to the network;
 - connections from the range are refused, and open connections from it end at once;
 - open connections to the range end within two seconds.
 
@@ -270,7 +366,11 @@ node [warns](storage.md#warnings) that it may be the one out of step.
 At the heights of the chain's [seed](../reference/conformance.md#the-seed), only the
 listed blocks are taken: any other is an invalid header. A listed block that this
 node's own execution rejects is the node's fault, not the peer's: the node stops and
-reports that it does not conform, holding nothing against the peer.
+reports that it does not conform, holding nothing against the peer. So is a block
+whose parent's state the node does not hold, as when its stored state is damaged:
+that state is the node's own, its root checked when the parent connected, and the
+block takes no part in it, so the node stops and says so, marking nothing invalid
+and holding nothing against the peer.
 
 Some failures look like misbehavior without proving it, and cost the peer nothing
 beyond the request: headers that do not follow the chain they continue, a chain that
@@ -280,29 +380,54 @@ either side does not take.
 ## Finding more peers
 
 A node on the production network needs no configured peer: the node carries the
-names of the network's seed nodes, looks them up as it starts, and learns from
-them. On any network, one configured peer is enough. A node learns further
-addresses from its peers and keeps connections to up to `max_peers` of them, eight
-unless configured otherwise. This follows the address exchange of Bitcoin, kept
-small: no separate discovery protocol, no distributed hash table, nothing beyond the
-connections above.
+names of the network's seed nodes, looks them up as it starts and from time to
+time, and learns from them. On any network, one configured peer is enough. A node
+learns further addresses from its peers and keeps connections to up to `max_peers`
+of them, eight unless configured otherwise. Every new connection asks for addresses first, before
+headers and blocks, so a node that knows only a seed learns of other peers at once.
+This follows the address exchange of Bitcoin, kept small: no separate discovery
+protocol, no distributed hash table, nothing beyond the connections above.
 
 **Where addresses come from.** A node keeps an address book of other nodes'
 listening addresses, filled from four sources:
 
 - on the production network, its seed nodes: `host:port` names built into the node,
-  each looked up for at most five seconds at every start; a name that does not
-  resolve is passed over;
+  each looked up for at most five seconds as the node starts, again every hour, as
+  often as an address that keeps failing is tried again, so that a seed whose
+  address changed is found by then, and every minute while the book holds no seed
+  address the node may connect to, as when bans or failures cover them all; a name
+  that does not resolve is passed over, and after the first lookup without a word
+  in the log;
 - its configured peers;
 - the listening port each connecting peer announces in its `hello`, taken at the IP
   address the connection came from;
 - the `addresses` its peers share, at most 32 from one answer, each only if the
   sending peer could reach it (below).
 
+No one source fills the book. Of the addresses it discovers, announced or shared, it
+keeps at most two of one public IP address, room for a node and a port it moved to,
+and 32 of one network group (an IPv4 /16, an IPv6 /32): a 32nd of the book, as
+Bitcoin's tried table keeps one group to 8 of its 256 buckets, so an attacker needs
+32 networks to fill it. A network group adds at most 32 in an hour, by announcing
+its own or by sharing others: as many as an honest peer's answer changes by in that
+time (below). When an address's IP address or network group holds its share, the
+least worth keeping of them gives way to it, never one the node has completed a
+round with. Configured peers and seeds count for none of this, and addresses on
+this machine or a private network have no share: they come only from there.
+
 **What a node shares.** An `addresses` answer holds at most 32 addresses in random
 order, and only addresses the node has itself completed a round with in the last 24
 hours, without a failure since. It never includes the asking peer's own announced
-address. An address reaches only peers that could reach it too:
+address. Every peer is given the same answer for an hour, drawn at the first request
+after the last one's hour, so that asking again, or over many connections, tells
+nothing new: neither the book nor the node's connections can be mapped by asking.
+Bitcoin keeps its answer for about a day, beside relaying addresses as it hears of
+them; here answers are the only way addresses spread, so a new node becomes known
+within hours rather than a day. An answer that held every address there was to
+share is drawn again as soon as there is another, so a node that has just started is
+not held to the few it knew, and an address that is banned leaves it at once. An
+address reaches only peers that could reach it too, and peers at private or loopback
+addresses have their own answer:
 
 | Address | Shared with and accepted from |
 |---|---|
@@ -315,15 +440,51 @@ address. An address reaches only peers that could reach it too:
 listening address, whatever `max_peers` says, and again a minute after a failed
 attempt. Up to `max_peers` connections in all, the node adds discovered peers from
 its book: those it has completed a round with first, most recent first, then untried
-ones in random order. Among public addresses it keeps at most one discovered peer
-per network group (an IPv4 /16, an IPv6 /32), so a single operator's address range
-cannot take every slot. A discovered peer whose connection fails is replaced, and
-its address is not tried again for a minute, doubling with each further failure up
-to an hour.
+ones in random order, and the seed nodes after every other. Among public addresses
+it keeps at most one discovered peer per network group (an IPv4 /16, an IPv6 /32),
+so a single operator's address range cannot take every slot. A discovered peer
+whose connection fails is replaced, and its address is not tried again for a
+minute, doubling with each further failure up to an hour. A delivered block counts
+as a completed round, so a long first download that fails partway still proves the
+peer; a `hello` alone does not, and a peer that answers it and then fails backs off
+like any other.
+
+**Leaving the seeds.** A seed node is where a node starts, not a peer it keeps: were
+every node to stay connected to the seeds, they would fill up as the network grows,
+and a new node, which knows no other address, could not join. A connection to a seed
+takes none of the `max_peers` slots, so a node starts other peers beside the seeds
+however few slots it has. What a peer claims of its own height counts for nothing
+here: only the height of its tip once the node holds that header, whose work it has
+checked. Nor does a peer caught claiming more than it holds, until it delivers a
+block: one at a tip as high as the node's best header that lacks a block the node
+asks it for, all of which lead to that header, and one that announces a tip and,
+asked for the headers past the node's own, shows none, while the node holds no such
+tip. The node's connections to the seed nodes end once all of these hold:
+
+- its own tip is within one block of its best header, as while the newest block
+  downloads, the test by which the built-in miner waits too: a node further behind
+  is still downloading, and only the seeds may be serving it;
+- it holds a seed's tip;
+- at least half of `max_peers` of its other connections, configured or discovered,
+  are at tips at least as high as its best header and not caught lacking: a peer
+  still behind, as another new node is, cannot serve it yet;
+- its tip is not [stale](#a-stale-tip).
+
+A peer need not have delivered a block itself to count: a node that has caught up
+takes each new block from the first peer to tell it of the block, and the others only
+announce it. The node goes back to the seeds, and connects them at once however many
+other peers it has, when its tip goes stale or once fewer than a quarter of
+`max_peers` other peers that are not caught lacking are connected, or none. So a peer
+that drops for a while does not bring the seeds back, and peers that announce blocks
+they then do not serve keep the node from them for no longer than it takes to catch
+them. A node that reaches only the seeds keeps them. A configured seed is a
+configured peer like any other, and an address a peer shared is marked as a seed's
+when the seed's name resolves to it. A seed's address is never dropped from a full
+book, nor by a ban.
 
 **Probing.** When every slot is taken, the node tests one untried address every two
-minutes with a connection that only exchanges `hello`. An address that answers can
-then be shared, so new nodes become known even in a full network.
+minutes with a connection that only exchanges `hello`, never a seed's. An address
+that answers can then be shared, so new nodes become known even in a full network.
 
 **Connecting to itself.** Each run of a node picks a random 64-bit nonce and sends it
 in `hello`. A peer that receives its own nonce refuses the connection, and a node
@@ -334,8 +495,11 @@ configured one.
 **The book.** It holds at most 1,024 addresses and lives in `peers.json` in the data
 directory, saved every two seconds when it has changed. When it is full, the address
 least worth keeping makes room: never a configured one, an untried one before one
-with a completed round, the most failed first. The file holds only hints; if it is
-missing or unreadable, the node starts with an empty book. A peer removed from the
+with a completed round, the most failed first, and of those alike one at random, so
+that no address can be chosen to stay or to go. The file holds only hints; if it is
+missing or unreadable, the node starts with an empty book. A book that holds more of
+one IP address or network group than its share keeps the best of them when it loads:
+the most recently proven, then the least failed. A peer removed from the
 configuration is forgotten, and connected again only if a peer shares its address
 later.
 
@@ -347,17 +511,28 @@ completes rounds with it and has discovery on shares it like any other.
 
 ## A stale tip
 
-When the tip has not moved for ten minutes, the node may be cut off from the rest of
-the network by peers that do not relay blocks. It then connects one discovered peer
-more than it otherwise keeps, until the tip moves again; then the discovered peer
-whose last new block came longest ago is dropped. This follows Bitcoin; on a quiet
-network it costs one extra connection.
+When the tip has not moved for ten minutes, ten times the block spacing, the node may
+be cut off from the rest of the network by peers that do not relay blocks. It then
+connects one discovered peer more than it otherwise keeps, until the tip moves again;
+then the discovered peer whose last new block came longest ago is dropped. This
+follows Bitcoin. It also connects the seed nodes, whether it had left them or not,
+and keeps them until its tip moves and it can [leave them](#finding-more-peers) again.
+On a quiet network this costs one extra connection and the connections to the seeds.
 
 ## Limits
 
 - At most 32 configured peers, and connections to up to `max_peers` peers (1 to 64,
-  default 8; one more while the tip is stale)
-- An address book of at most 1,024 addresses
+  default 8; one more while the tip is stale), the seed nodes aside
+- Connections from up to `max_inbound` peers (1 to 1,024, default 125, read at
+  start), at most 8 from one address range. A full node still takes a new
+  connection, in place of the one least worth keeping: the peers that delivered new
+  blocks latest, the longest connected, the connections of the node's own machine
+  and those less than ten seconds old keep theirs. An operator raises
+  `max_inbound` for a seed node; on Unix the node raises its open-file limit to
+  match as it starts, as far as the system's hard limit allows
+- An address book of at most 1,024 addresses: of the discovered ones, at most 2 of
+  one public IP address and 32 of one network group, and at most 32 added by one
+  network group in an hour
 
 The transport's own limits, on connections, requests and frames, are on
 [Peer protocol](../reference/peer-protocol.md#limits).
