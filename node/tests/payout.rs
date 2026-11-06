@@ -242,6 +242,13 @@ fn the_miner_claims_each_reward_of_a_coin_into_its_payout_account() {
 /// and otherwise fails; without such input, as when deployed, it does nothing.
 /// Imports by place: input, emit, storage_get, storage_set, revert.
 fn sequenced() -> Vec<u8> {
+    sequenced_failing_with("(call 4 (i32.const 0) (i32.const 0)) (unreachable)")
+}
+/// [`sequenced`], but out of sequence it spins until its compute runs out.
+fn sequenced_or_spinning() -> Vec<u8> {
+    sequenced_failing_with("(loop (br 0))")
+}
+fn sequenced_failing_with(fail: &str) -> Vec<u8> {
     let topic: String = payout::payment_topic()
         .iter()
         .map(|b| format!("\\{b:02x}"))
@@ -260,7 +267,7 @@ fn sequenced() -> Vec<u8> {
               (then (return)))
             (drop (call 2 (i32.const 128) (i32.const 160) (i32.const 8)))
             (if (i64.ne (i64.load (i32.const 80)) (i64.load (i32.const 160)))
-              (then (call 4 (i32.const 0) (i32.const 0)) (unreachable)))
+              (then {fail}))
             (i64.store (i32.const 160) (i64.add (i64.load (i32.const 160)) (i64.const 1)))
             (call 3 (i32.const 128) (i32.const 160) (i32.const 8))
             (call 1 (i32.const 0) (i32.const 80))))"#
@@ -322,13 +329,10 @@ fn a_payment_that_needs_another_first_is_taken_after_it() {
     );
 }
 
-#[test]
-fn a_payment_left_untried_by_the_allowance_is_ranked_by_a_later_template() {
-    let me = [7; 32];
-    let (_dir, mut chain, program, chain_id) = paid_miner(payer(), false, 1_024);
-    // Two calls that spin until their compute runs out, and so pay nothing:
-    // trying them spends a template's allowance for discarded work. The
-    // program spins only when given input, so its deployment returns at once.
+/// Deploys a program whose calls spin until their compute runs out, and so
+/// fail and pay nothing: running one spends its whole budget of C. It spins
+/// only when given input, so its deployment returns at once.
+fn spinner(chain: &mut Chain, chain_id: Hash) -> Hash {
     let spinner = deploy(
         wat::parse_str(
             r#"(module
@@ -342,16 +346,40 @@ fn a_payment_left_untried_by_the_allowance_is_ranked_by_a_later_template() {
         .unwrap(),
         vec![],
     );
-    let spinner_id = contract_id(&chain_id, &spinner);
     chain.submit(&spinner.encode()).unwrap();
-    mine_exactly(&mut chain, &[hex(&spinner.id(chain_id))]);
-    let spins = [0, 1].map(|n| Transaction {
-        budget: Resources([60_000_000, 16, 4_096, 4_096]),
+    mine_exactly(chain, &[hex(&spinner.id(chain_id))]);
+    contract_id(&chain_id, &spinner)
+}
+/// A call of `spinner` that spins through `compute`, told apart by `n`.
+fn spin(spinner: Hash, compute: u64, n: u8) -> Transaction {
+    Transaction {
+        budget: Resources([compute, 16, 4_096, 4_096]),
         payload: Payload::Call {
-            target: spinner_id,
+            target: spinner,
             input: vec![n],
         },
-    });
+    }
+}
+/// The transactions of `count` templates in a row, each as the hex of its id.
+fn templates(chain: &mut Chain, count: usize) -> Vec<Vec<String>> {
+    (0..count)
+        .map(|_| {
+            let template = chain.request("template", json!({})).unwrap();
+            serde_json::from_value(template["transactions"].clone()).unwrap()
+        })
+        .collect()
+}
+
+#[test]
+fn a_payment_left_untried_by_the_allowance_is_ranked_by_a_later_template() {
+    let me = [7; 32];
+    let (_dir, mut chain, program, chain_id) = paid_miner(payer(), false, 1_024);
+    // Sixty calls that spin through a million C each, then a payment. Ranking
+    // them takes the half of a template's allowance for discarded work that
+    // ranking may, 50 million C on the development chain, and trying them again
+    // in the last pass the other half.
+    let spinner = spinner(&mut chain, chain_id);
+    let spins: Vec<Transaction> = (0..60).map(|n| spin(spinner, 1_000_000, n)).collect();
     let paid = pay(program, &me, 1_000);
     for tx in spins.iter().chain([&paid]) {
         chain.submit(&tx.encode()).unwrap();
@@ -362,6 +390,174 @@ fn a_payment_left_untried_by_the_allowance_is_ranked_by_a_later_template() {
     assert_eq!(template["transactions"], json!([]));
     let template = chain.request("template", json!({})).unwrap();
     assert_eq!(template["transactions"], json!([hex(&paid.id(chain_id))]));
+}
+
+/// Transactions that fail are never in a block of a paid miner and stay in
+/// the pool, costing their sender nothing, while trying them spends a
+/// template's allowance for discarded work. Taken in turns by address range,
+/// they keep no other range's transaction out.
+#[test]
+fn transactions_that_fail_leave_no_other_range_waiting() {
+    use std::net::IpAddr;
+    let (_dir, mut chain, program, chain_id) = paid_miner(payer(), true, 1_024);
+    let spinner = spinner(&mut chain, chain_id);
+    let (attacker, other): (IpAddr, IpAddr) =
+        ("10.0.0.66".parse().unwrap(), "10.0.0.1".parse().unwrap());
+    // Two calls that fail, together more than the allowance, arrive first;
+    // then a transfer that succeeds and pays the miner nothing.
+    let spins = [0, 1].map(|n| spin(spinner, 60_000_000, n));
+    for tx in &spins {
+        chain.submit_from(&tx.encode(), Some(attacker)).unwrap();
+    }
+    let unpaid = pay(program, &[9; 32], 1);
+    chain.submit_from(&unpaid.encode(), Some(other)).unwrap();
+    let unpaid = hex(&unpaid.id(chain_id));
+    for (n, transactions) in templates(&mut chain, 8).iter().enumerate() {
+        assert_eq!(transactions, std::slice::from_ref(&unpaid), "template {n}");
+    }
+}
+
+/// A stream of new transactions that fail, each costing its sender nothing,
+/// takes at most half of each template's allowance to rank: the payments keep
+/// the other half.
+#[test]
+fn a_stream_of_failing_transactions_keeps_no_payment_out() {
+    use std::net::IpAddr;
+    let me = [7; 32];
+    let (_dir, mut chain, program, chain_id) = paid_miner(payer(), true, 1_024);
+    let spinner = spinner(&mut chain, chain_id);
+    let attacker: IpAddr = "10.0.0.66".parse().unwrap();
+    let paid = pay(program, &me, 1_000);
+    chain.submit(&paid.encode()).unwrap();
+    let paid = hex(&paid.id(chain_id));
+    // Before each template, eleven new calls that spin through 10 million C
+    // each: more than the whole allowance to rank them all.
+    for template in 0..3u8 {
+        for n in 0..11 {
+            let fresh = spin(spinner, 10_000_000, template * 11 + n);
+            chain.submit_from(&fresh.encode(), Some(attacker)).unwrap();
+        }
+        let shown = &templates(&mut chain, 1)[0];
+        assert_eq!(shown, std::slice::from_ref(&paid), "template {template}");
+    }
+}
+
+/// A range's own transactions that fail keep none of its later ones out: the
+/// one that ran longest ago, or never, goes first within the range.
+#[test]
+fn a_range_s_failing_transactions_keep_none_of_its_others_out() {
+    use std::net::IpAddr;
+    let (_dir, mut chain, program, chain_id) = paid_miner(payer(), true, 1_024);
+    let spinner = spinner(&mut chain, chain_id);
+    let sender: IpAddr = "10.0.0.1".parse().unwrap();
+    // From one address: two calls that fail, together more than the
+    // allowance, then a transfer that succeeds and pays the miner nothing.
+    let spins = [0, 1].map(|n| spin(spinner, 60_000_000, n));
+    let unpaid = pay(program, &[9; 32], 1);
+    for tx in spins.iter().chain([&unpaid]) {
+        chain.submit_from(&tx.encode(), Some(sender)).unwrap();
+    }
+    let unpaid = hex(&unpaid.id(chain_id));
+    let shown = templates(&mut chain, 8);
+    assert!(shown[1].contains(&unpaid), "{shown:?}");
+    for n in 2..shown.len() {
+        assert!(
+            shown[n].contains(&unpaid) || shown[n - 1].contains(&unpaid),
+            "templates {} and {n} both leave the transfer out: {shown:?}",
+            n - 1
+        );
+    }
+}
+
+/// A transaction ranked as paying that fails once the block holds another,
+/// as a second payment in the same sequence, is no longer ranked as paying:
+/// spending the allowance best paid first in every template, such payments
+/// would keep every transaction of the last pass out.
+#[test]
+fn a_payment_that_fails_in_the_block_is_no_longer_ranked_as_paying() {
+    use std::net::IpAddr;
+    let me = [7; 32];
+    let (_dir, mut chain, program, chain_id) = paid_miner(sequenced_or_spinning(), true, 1_024);
+    // One payment of number 0 pays most; nine more of number 0, each ranked
+    // as paying alone, spin through 12 million C each once it is in. Then a
+    // transfer of another range that pays the miner nothing.
+    let first = pay_next(program, &me, 10_000, 0);
+    let spinning: Vec<Transaction> = (0..9)
+        .map(|n| Transaction {
+            budget: Resources([12_000_000, 16, 4_096, 4_096]),
+            ..pay_next(program, &me, 5_000 + n, 0)
+        })
+        .collect();
+    for tx in [&first].into_iter().chain(&spinning) {
+        chain.submit(&tx.encode()).unwrap();
+    }
+    let unpaid = pay_next(program, &[9; 32], 1, 1);
+    let other: IpAddr = "10.0.0.1".parse().unwrap();
+    chain.submit_from(&unpaid.encode(), Some(other)).unwrap();
+    let (first, unpaid) = (hex(&first.id(chain_id)), hex(&unpaid.id(chain_id)));
+    // Ranking takes three templates at most; the payment and the transfer are
+    // in every template after.
+    let shown = templates(&mut chain, 8);
+    for (n, transactions) in shown.iter().enumerate().skip(2) {
+        assert_eq!(
+            transactions,
+            &[first.clone(), unpaid.clone()],
+            "template {n}"
+        );
+    }
+}
+
+/// Transactions too large for the room the block has left, as block fillers
+/// behind a paid transaction, spend the allowance whenever they are tried,
+/// each up to the room left: their ranges go to the back of the queue for it,
+/// as for ones that fail, rather than keeping their places, and their claim on
+/// every template's allowance, while an unpaid transaction of another range
+/// waits behind them.
+#[test]
+fn transactions_the_block_cannot_fit_leave_no_other_range_waiting() {
+    use std::net::IpAddr;
+    let me = [7; 32];
+    let (_dir, mut chain, program, chain_id) = paid_miner(payer(), true, 1_024);
+    let spinner = spinner(&mut chain, chain_id);
+    let address = |n: u8| -> IpAddr { format!("10.0.0.{n}").parse().unwrap() };
+    // A payment; then from two ranges a call each that spins through a whole
+    // block's compute, which fits only an empty block; then a transfer that
+    // pays nothing.
+    let paid = pay(program, &me, 1_000);
+    chain.submit(&paid.encode()).unwrap();
+    let fillers = [0, 1].map(|n| spin(spinner, 100_000_000, n));
+    for (n, filler) in fillers.iter().enumerate() {
+        chain
+            .submit_from(&filler.encode(), Some(address(66 + n as u8)))
+            .unwrap();
+    }
+    let unpaid = pay(program, &[9; 32], 1);
+    chain
+        .submit_from(&unpaid.encode(), Some(address(1)))
+        .unwrap();
+    let (paid, unpaid) = (hex(&paid.id(chain_id)), hex(&unpaid.id(chain_id)));
+    let fillers = fillers.map(|filler| hex(&filler.id(chain_id)));
+    // The first templates spend their allowance learning what each pays; from
+    // the first that holds the payment on, the fillers are in none, and the
+    // transfer is left out of no two in a row.
+    let shown = templates(&mut chain, 12);
+    let start = shown
+        .iter()
+        .position(|transactions| transactions.contains(&paid))
+        .unwrap();
+    assert!(start <= 2, "{shown:?}");
+    for n in start..shown.len() {
+        assert_eq!(shown[n].first(), Some(&paid), "template {n}");
+        assert!(
+            !fillers.iter().any(|f| shown[n].contains(f)),
+            "template {n}"
+        );
+        assert!(
+            n == start || shown[n].contains(&unpaid) || shown[n - 1].contains(&unpaid),
+            "templates {} and {n} both leave the transfer out: {shown:?}",
+            n - 1
+        );
+    }
 }
 
 #[test]

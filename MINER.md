@@ -17,16 +17,29 @@ The selector in `node/src/payout.rs`, which `ting run` uses:
    and the producer payments it emits to this miner's payout account are added up,
    each asset valued as `assets` says. Its rank is that value per share of the
    block, the largest fraction of any capacity it uses, and is remembered while the
-   transaction is pooled: what a transaction pays does not change with the tip.
-   Transactions are taken best first, each kept only if it still succeeds and pays
-   after what the block holds by then. These tries count against Ting's allowance
-   for the work a template throws away (`node/mining`): a transaction it leaves
-   untried is ranked by a later template, not counted as paying nothing.
-3. **The rest.** The others are tried once more in arrival order. One that pays now,
-   such as a second payment from an account whose first the block already holds, is
-   kept and ranked by what it paid. With `unpaid` on, the default, one that succeeds
-   and pays nothing is kept too.
-4. **A full pool.** When the pool is full, the transaction that pays least per
+   transaction is pooled. Transactions are taken best first, each kept only if it
+   still succeeds and pays after what the block holds by then; one that no longer
+   does is no longer ranked as paying, and waits its turn with the rest.
+3. **The rest.** The others are tried once more. One that pays now, such as a
+   second payment from an account whose first the block already holds, is kept and
+   ranked by what it paid. With `unpaid` on, the default, one that succeeds and pays
+   nothing is kept too.
+4. **Turns.** A transaction that fails is never in this miner's blocks, so it stays
+   in the pool and costs its sender nothing, while every try counts against Ting's
+   allowance for the work a template throws away (`node/mining`), a block's compute.
+   So no try may keep the others out:
+   - Ranking takes at most half of it, counted by the transactions' budgets. A
+     transaction that doesn't fit what is left is ranked by a later template, or
+     when the rest is tried, not counted as paying nothing; the passes that keep
+     transactions always have the other half.
+   - Ranking and the rest take the pool in turns by address range, as Ting's
+     `FirstIn` does: the first transaction of each range before the second of any,
+     the ranges in queue order. A range goes to the back of the queue whenever a
+     template runs one of its transactions to keep it, whether the block then holds
+     it, takes it back out, or has no room for it.
+   - Within a range, the transaction that ran longest ago, or never, goes first, so
+     a range's own failing transaction doesn't keep its later ones out either.
+5. **A full pool.** When the pool is full, the transaction that pays least per
    share of the block gives way to a newcomer that pays more. Only transactions of
    address ranges holding at least as many as the newcomer's range can give way, so
    a range cannot push out others' transactions, with payments of its own that
