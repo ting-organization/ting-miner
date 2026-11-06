@@ -16,7 +16,7 @@ use crate::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::OpenOptions,
     io::{ErrorKind, Write},
     net::IpAddr,
@@ -121,11 +121,38 @@ pub struct Payout {
     claims: Vec<Hash>,
     unpaid: bool,
     /// What each transaction pays per share of the block, tried alone on a
-    /// block on the tip, by id: learned once, since what a transaction pays
-    /// does not change with the tip, and kept while it is pooled.
+    /// block on the tip, by id: learned once and kept while it is pooled, or
+    /// learned from what it paid when a block kept it. One ranked as paying
+    /// that a block takes back out ranks as paying nothing.
     ranks: HashMap<Hash, f64>,
+    /// Templates selected so far; each address range's place in the queue in
+    /// which the ranges take turns, as Ting's `FirstIn` keeps it: the template
+    /// in which one of its transactions last ran, or the one before the
+    /// template that first found it in the pool; and the template in which
+    /// each pooled transaction last ran, to keep or take back out.
+    turn: u64,
+    sources: BTreeMap<Option<IpAddr>, u64>,
+    runs: HashMap<Hash, u64>,
     /// The reference selection, for a block that pays nobody.
     reference: FirstIn,
+}
+/// What became of a transaction [`Payout::keep`] tried.
+enum Tried {
+    /// The block holds it, and it pays this much per share of the block.
+    Kept(f64),
+    /// It ran and was taken back out: it failed, or paid nothing where that
+    /// would not do.
+    TakenBack,
+    /// It ran and the block had no room for it.
+    Unfit,
+    /// It did not run: the block's allowance for discarded work was spent.
+    Untried,
+}
+/// The address range a pooled transaction came from, by which the ranges take
+/// turns and hold shares of the pool: an IPv4 address or an IPv6 /64, as Ting
+/// counts them (`discovery::range`); none for the node's own.
+fn range(pending: &Pending<'_>) -> Option<IpAddr> {
+    pending.source.map(discovery::range)
 }
 impl Payout {
     pub fn new(policy: &Policy) -> Result<Self> {
@@ -148,6 +175,9 @@ impl Payout {
             claims: policy.claims.iter().map(|c| id(c)).collect::<Result<_>>()?,
             unpaid: policy.unpaid,
             ranks: HashMap::new(),
+            turn: 0,
+            sources: BTreeMap::new(),
+            runs: HashMap::new(),
             reference: FirstIn::default(),
         })
     }
@@ -202,17 +232,20 @@ impl Payout {
         Some(rank)
     }
     /// Adds `tx` to `block` and keeps it if it succeeds and, unless `unpaid`
-    /// will do, pays: what it pays per share, or none when it was taken back.
+    /// will do, pays.
     fn keep(
         &self,
         tx: &Transaction,
         payee: &Hash,
         unpaid: bool,
         block: &mut Candidate<'_>,
-    ) -> Option<f64> {
+    ) -> Tried {
+        if block.spent() {
+            return Tried::Untried;
+        }
         let limits = block.limits();
         let Ok(Some(receipt)) = block.add(tx) else {
-            return None;
+            return Tried::Unfit;
         };
         let success = receipt.status == Status::Success;
         let paid = if success {
@@ -221,14 +254,62 @@ impl Payout {
             0.0
         };
         if success && (paid > 0.0 || unpaid) {
-            Some(paid)
+            Tried::Kept(paid)
         } else {
             block.undo();
-            None
+            Tried::TakenBack
         }
+    }
+    /// Notes that this template ran `pending` to keep it: its range goes to
+    /// the back of the queue, and it behind the others of its range.
+    fn ran(&mut self, pending: &Pending<'_>) {
+        self.sources.insert(range(pending), self.turn);
+        self.runs.insert(pending.id, self.turn);
+    }
+    /// The order in which the passes take the pool, as Ting's `FirstIn` takes
+    /// it (`mining::turns`): the first transaction of each address range
+    /// before the second of any, the ranges in queue order, and arrival order
+    /// among equals. Within a range, the transaction that ran longest ago, or
+    /// never, comes first, so that one which ran and was taken back out waits
+    /// behind the others of its range, and a range's own failing transaction
+    /// does not keep its later ones out.
+    fn order(&self, pool: &[Pending<'_>]) -> Vec<usize> {
+        let mut ranges: BTreeMap<Option<IpAddr>, Vec<usize>> = BTreeMap::new();
+        for (i, pending) in pool.iter().enumerate() {
+            ranges.entry(range(pending)).or_default().push(i);
+        }
+        let mut order = Vec::with_capacity(pool.len());
+        for (key, arrivals) in &ranges {
+            let place = self.sources.get(key).copied().unwrap_or(u64::MAX);
+            let mut members = arrivals.clone();
+            members.sort_by_key(|&i| (self.runs.get(&pool[i].id).copied().unwrap_or(0), i));
+            // The k-th of a range ties with other ranges by the range's k-th
+            // arrival, as in Ting's order.
+            for (k, (&i, &arrival)) in members.iter().zip(arrivals).enumerate() {
+                order.push((k, place, arrival, i));
+            }
+        }
+        order.sort_unstable();
+        order.into_iter().map(|(.., i)| i).collect()
     }
 }
 impl Selector for Payout {
+    /// The claims; what the transactions not yet ranked pay; the paying ones,
+    /// best paid first; then the others. A transaction that fails is never in
+    /// the block, so it stays pooled and costs its sender nothing, while
+    /// running it spends the template's allowance for discarded work. So no
+    /// pass lets such transactions keep the others out:
+    ///
+    /// - Ranking takes at most half a block's compute, half the allowance Ting
+    ///   gives a template, by the transactions' budgets: the passes that keep
+    ///   transactions always have the other half.
+    /// - Ranking and the last pass take the pool in turns by address range
+    ///   (`order`), and a range goes to the back of the queue whenever a
+    ///   template runs one of its transactions to keep it, whether the block
+    ///   then holds it, takes it back out, or has no room for it. Only one the
+    ///   allowance left untried keeps its place.
+    /// - A paying transaction that fails or no longer pays is no longer ranked
+    ///   as paying, and waits its range's turn with the others.
     fn select(&mut self, pool: &[Pending<'_>], block: &mut Candidate<'_>) {
         let Some(payee) = payout_account(block.producer()) else {
             // Nobody to pay: nothing to claim or rank by.
@@ -245,38 +326,72 @@ impl Selector for Payout {
                 block.undo();
             }
         }
-        // What each pending transaction pays per share of the block, tried
-        // alone once; what left the pool is forgotten.
+        // The queue: ranges no longer in the pool leave it, new ones join its
+        // back.
+        self.turn = self.turn.saturating_add(1);
+        let present: BTreeSet<Option<IpAddr>> = pool.iter().map(range).collect();
+        self.sources.retain(|key, _| present.contains(key));
+        let joined = self.turn - 1;
+        for key in present {
+            self.sources.entry(key).or_insert(joined);
+        }
+        // What left the pool is forgotten.
         let pooled: HashSet<Hash> = pool.iter().map(|p| p.id).collect();
         self.ranks.retain(|id, _| pooled.contains(id));
+        self.runs.retain(|id, _| pooled.contains(id));
+        let order = self.order(pool);
+        // What each pending transaction pays per share of the block, tried
+        // alone once, in turn, while its budget of compute fits in what is
+        // left of half a block's. One that does not fit is ranked when a
+        // later pass keeps it.
+        let mut room = block.limits().0[0] / 2;
         let mut paying = Vec::new();
-        for (i, pending) in pool.iter().enumerate() {
-            if let Some(rank) = self.rank(pending, &payee, block)
+        for (place, &i) in order.iter().enumerate() {
+            if !self.ranks.contains_key(&pool[i].id) {
+                let compute = pool[i].tx.budget.0[0];
+                if compute > room {
+                    continue;
+                }
+                room -= compute;
+            }
+            if let Some(rank) = self.rank(&pool[i], &payee, block)
                 && rank > 0.0
             {
-                paying.push((rank, i));
+                paying.push((rank, place, i));
             }
         }
-        // Best paid first, ties in arrival order, each kept only if it still
-        // succeeds and pays after what the block holds by then.
+        // Best paid first, ties in turn, each kept only if it still succeeds
+        // and pays after what the block holds by then; one taken back is no
+        // longer ranked as paying.
         paying.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
         let mut taken = vec![false; pool.len()];
-        for (_, i) in paying {
-            taken[i] = self.keep(pool[i].tx, &payee, false, block).is_some();
+        for (_, _, i) in paying {
+            match self.keep(pool[i].tx, &payee, false, block) {
+                Tried::Untried => continue,
+                Tried::Kept(_) => taken[i] = true,
+                Tried::TakenBack => {
+                    self.ranks.insert(pool[i].id, 0.0);
+                }
+                Tried::Unfit => {}
+            }
+            self.ran(&pool[i]);
         }
-        // Then the others, once each in arrival order: one that pays now,
-        // such as the next payment of an account the block already holds one
-        // of, is kept and ranked by what it paid; with `unpaid`, so is one
-        // that succeeds and pays nothing.
-        for (i, pending) in pool.iter().enumerate() {
+        // Then the others, once each in turn: one that pays now, such as the
+        // next payment of an account the block already holds one of, is kept
+        // and ranked by what it paid; with `unpaid`, so is one that succeeds
+        // and pays nothing.
+        for &i in &order {
             if taken[i] {
                 continue;
             }
-            if let Some(paid) = self.keep(pending.tx, &payee, self.unpaid, block)
-                && paid > 0.0
-            {
-                self.ranks.insert(pending.id, paid);
+            match self.keep(pool[i].tx, &payee, self.unpaid, block) {
+                Tried::Untried => continue,
+                Tried::Kept(paid) if paid > 0.0 => {
+                    self.ranks.insert(pool[i].id, paid);
+                }
+                Tried::Kept(_) | Tried::TakenBack | Tried::Unfit => {}
             }
+            self.ran(&pool[i]);
         }
     }
     /// In a full pool, the transaction that pays least per share of the block
@@ -300,7 +415,6 @@ impl Selector for Payout {
             return fair_share(pool, incoming);
         };
         let offered = self.rank(incoming, &payee, block).unwrap_or(0.0);
-        let range = |pending: &Pending<'_>| pending.source.map(discovery::range);
         let mut held: HashMap<IpAddr, usize> = HashMap::new();
         for pending in pool {
             if let Some(source) = range(pending) {
