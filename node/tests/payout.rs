@@ -452,14 +452,19 @@ fn ting(dir: &Directory, args: &[&str]) -> std::process::Output {
     }
     command.output().unwrap()
 }
+/// A command's result, printed as JSON.
 fn answer(dir: &Directory, args: &[&str]) -> serde_json::Value {
+    serde_json::from_str(&text(dir, &[&["--json"], args].concat())).unwrap()
+}
+/// A command's text, as a person reads it.
+fn text(dir: &Directory, args: &[&str]) -> String {
     let output = ting(dir, args);
     assert!(
         output.status.success(),
         "{args:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    serde_json::from_slice(&output.stdout).unwrap()
+    String::from_utf8(output.stdout).unwrap()
 }
 /// Stops the node of a test that started one, however the test ends.
 struct Stop<'a>(&'a Directory);
@@ -490,6 +495,19 @@ fn the_payout_command_sets_the_account_the_blocks_pay_and_shows_it() {
         answer(&dir, &["miner", "payout"])["payout"],
         json!(first.to_lowercase())
     );
+    // As text: the account, and where it went.
+    let pays = |account: &str| format!("the blocks this node builds pay {account}");
+    let saved = text(&dir, &["miner", "payout", &first]);
+    assert!(saved.starts_with("Saved in config.json"), "{saved}");
+    assert!(saved.contains(&pays(&first.to_lowercase())), "{saved}");
+    let shown = text(&dir, &["miner", "payout"]);
+    assert_eq!(
+        shown,
+        format!(
+            "The blocks this node builds pay {}.\n",
+            first.to_lowercase()
+        )
+    );
 
     answer(&dir, &["start"]);
     let _stop = Stop(&dir);
@@ -500,10 +518,27 @@ fn the_payout_command_sets_the_account_the_blocks_pay_and_shows_it() {
     let status = answer(&dir, &["miner", "status"]);
     assert_eq!(status["payout"], json!(second));
     assert_eq!(status["producer_hex"], json!(paying(&second)));
+    let set = text(&dir, &["miner", "payout", &second]);
+    assert!(set.contains("from its next template"), "{set}");
+    let status = text(&dir, &["miner", "status"]);
+    assert!(
+        status
+            .lines()
+            .any(|line| line.starts_with("Payout") && line.ends_with(&format!("  {second}"))),
+        "{status}"
+    );
     // Producer data naming no payout account pays nobody.
     answer(&dir, &["miner", "producer", "4f435031"]);
     assert_eq!(answer(&dir, &["miner", "status"])["payout"], json!(null));
     assert_eq!(answer(&dir, &["miner", "payout"])["payout"], json!(null));
+    let none = text(&dir, &["miner", "payout"]);
+    assert!(none.contains("pay no account"), "{none}");
+    assert!(none.contains("miner payout <account>"), "{none}");
+    let status = text(&dir, &["miner", "status"]);
+    assert!(
+        status.contains("none: the blocks claim nothing"),
+        "{status}"
+    );
 }
 
 /// `ting init` gives a production node the production policy, claiming and
@@ -513,7 +548,12 @@ fn the_payout_command_sets_the_account_the_blocks_pay_and_shows_it() {
 fn a_new_production_node_mines_daler_and_another_network_nothing() {
     let daler = "305378d17f6af84a563d0f8a8455084948aff7330b62b4f2f98a44b82ba113c4";
     let production = Directory::new();
-    answer(&production, &["init"]);
+    let created = text(&production, &["init"]);
+    assert!(
+        created.contains("miner.json mines Daler (DLR)"),
+        "{created}"
+    );
+    assert!(created.contains("miner payout <account>"), "{created}");
     let written = std::fs::read_to_string(production.0.join("miner.json")).unwrap();
     assert_eq!(written, payout::PRODUCTION_POLICY);
     let policy = Policy::load(&production.0).unwrap();
@@ -522,13 +562,14 @@ fn a_new_production_node_mines_daler_and_another_network_nothing() {
     assert!(policy.unpaid);
 
     let development = Directory::new();
-    answer(&development, &["init", "--dev"]);
+    let created = text(&development, &["init", "--dev"]);
+    assert!(!created.contains("miner.json"), "{created}");
     assert!(!development.0.join("miner.json").exists());
     assert!(Policy::load(&development.0).unwrap().claims.is_empty());
 
     let own = r#"{"assets":{},"claims":[]}"#;
     std::fs::write(production.0.join("miner.json"), own).unwrap();
-    payout::initialize(&production.0).unwrap();
+    assert!(!payout::initialize(&production.0).unwrap());
     let kept = std::fs::read_to_string(production.0.join("miner.json")).unwrap();
     assert_eq!(kept, own);
 }
