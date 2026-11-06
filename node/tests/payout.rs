@@ -411,6 +411,52 @@ fn a_full_pool_lets_the_lowest_payment_give_way() {
     );
 }
 
+/// The addresses of one IPv6 /64 count as one range, as Ting's shares do: a
+/// fresh address in it pushes out no other range's payment beyond the range's
+/// equal share, while another /64 can.
+#[test]
+fn a_full_pool_counts_an_ipv6_64_as_one_range() {
+    use std::net::IpAddr;
+    let me = [7; 32];
+    let (_dir, mut chain, program, chain_id) = paid_miner(payer(), true, 3);
+    let address = |a: &str| -> IpAddr { a.parse().unwrap() };
+    let pooled = |chain: &mut Chain, tx: &Transaction| {
+        chain
+            .request("transaction", json!({"id":hex(&tx.id(chain_id))}))
+            .is_ok()
+    };
+    // Another range's payment of 10, then two of one /64, each from its own
+    // address.
+    let ten = pay(program, &me, 10);
+    chain
+        .submit_from(&ten.encode(), Some(address("10.0.0.1")))
+        .unwrap();
+    let range: Vec<Transaction> = [20, 30].map(|n| pay(program, &me, n)).to_vec();
+    for (tx, from) in range.iter().zip(["2001:db8::1", "2001:db8::2"]) {
+        chain
+            .submit_from(&tx.encode(), Some(address(from)))
+            .unwrap();
+    }
+    // A third address of the /64 pays 15, more than the 10: its range already
+    // holds more than the 10's, so the 10 stays, and none of its own pays less.
+    let fifteen = pay(program, &me, 15);
+    assert_eq!(
+        chain
+            .submit_from(&fifteen.encode(), Some(address("2001:db8::3")))
+            .unwrap_err(),
+        ting_node::chain::POOL_FULL
+    );
+    for tx in [&ten, &range[0], &range[1]] {
+        assert!(pooled(&mut chain, tx));
+    }
+    // The next /64 holds nothing yet: its 15 takes the place of the 10.
+    chain
+        .submit_from(&fifteen.encode(), Some(address("2001:db8:0:1::1")))
+        .unwrap();
+    assert!(!pooled(&mut chain, &ten));
+    assert!(pooled(&mut chain, &fifteen));
+}
+
 #[test]
 fn an_account_as_a_wallet_shows_it_becomes_producer_data_paying_it() {
     let account = "0123456789ABCDEF".repeat(4);

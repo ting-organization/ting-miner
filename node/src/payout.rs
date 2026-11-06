@@ -9,6 +9,7 @@
 use crate::{
     Result,
     daemon::Mining,
+    discovery,
     mining::{FirstIn, Pending, Selector, fair_share},
     search::{self, Choice},
 };
@@ -279,14 +280,16 @@ impl Selector for Payout {
         }
     }
     /// In a full pool, the transaction that pays least per share of the block
-    /// gives way, if it pays less than the newcomer, among those of addresses
-    /// holding at least as many as the newcomer's: so an address cannot push
-    /// out others' transactions with ones of its own that will fail, beyond an
-    /// equal share. Among equals the most recent gives way. When none pays
-    /// less, the reference rule decides, but never against a transaction that
-    /// pays more than the newcomer. The node's own submissions never give way,
-    /// and neither does one whose rank is unknown; a newcomer's unknown rank
-    /// counts as paying nothing.
+    /// gives way, if it pays less than the newcomer, among those of address
+    /// ranges holding at least as many as the newcomer's: so a range cannot
+    /// push out others' transactions with ones of its own that will fail,
+    /// beyond an equal share. A range is an IPv4 address or an IPv6 /64, as
+    /// Ting's shares count (`discovery::range`), so the many addresses of one
+    /// /64 hold one share between them. Among equals the most recent gives
+    /// way. When none pays less, the reference rule decides, but never against
+    /// a transaction that pays more than the newcomer. The node's own
+    /// submissions never give way, and neither does one whose rank is unknown;
+    /// a newcomer's unknown rank counts as paying nothing.
     fn give_way(
         &mut self,
         pool: &[Pending<'_>],
@@ -297,19 +300,19 @@ impl Selector for Payout {
             return fair_share(pool, incoming);
         };
         let offered = self.rank(incoming, &payee, block).unwrap_or(0.0);
+        let range = |pending: &Pending<'_>| pending.source.map(discovery::range);
         let mut held: HashMap<IpAddr, usize> = HashMap::new();
         for pending in pool {
-            if let Some(source) = pending.source {
+            if let Some(source) = range(pending) {
                 *held.entry(source).or_default() += 1;
             }
         }
-        let own = incoming
-            .source
+        let own = range(incoming)
             .and_then(|source| held.get(&source).copied())
             .unwrap_or(0);
         let mut lowest: Option<(f64, usize)> = None;
         for (i, pending) in pool.iter().enumerate() {
-            let Some(source) = pending.source else {
+            let Some(source) = range(pending) else {
                 continue;
             };
             if held[&source] < own {

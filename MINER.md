@@ -28,12 +28,14 @@ The selector in `node/src/payout.rs`, which `ting run` uses:
    and pays nothing is kept too.
 4. **A full pool.** When the pool is full, the transaction that pays least per
    share of the block gives way to a newcomer that pays more. Only transactions of
-   addresses holding at least as many as the newcomer's address can give way, so an
-   address cannot push out others' transactions, with payments of its own that
-   will fail, beyond an equal share. When none pays less, Ting's rule decides, but
-   never against a transaction that pays more than the newcomer. Transactions this
-   node's own API or CLI submitted never give way. The pool's size is Ting's
-   `mempool_transactions` and `mempool_mib` in `config.json`.
+   address ranges holding at least as many as the newcomer's range can give way, so
+   a range cannot push out others' transactions, with payments of its own that
+   will fail, beyond an equal share. A range is an IPv4 address or an IPv6 /64, as
+   Ting's shares count, so one subscriber's many IPv6 addresses hold one share
+   between them. When none pays less, Ting's rule decides, but never against a
+   transaction that pays more than the newcomer. Transactions this node's own API
+   or CLI submitted never give way. The pool's size is Ting's `mempool_transactions`
+   and `mempool_mib` in `config.json`.
 
 Everything comes from the program conventions of the Ting wiki
 (`programs/conventions`): the payout account in producer data, and the producer
