@@ -11,9 +11,11 @@ use ting_core::{
 };
 use ting_node::{
     chain::Chain,
-    config, payout,
-    wallet::{self, Key, Transfer},
+    config::{self, Running},
+    payout, transport,
+    wallet::{self, Command, Key, Transfer},
 };
+use zeroize::Zeroizing;
 
 fn program(name: &str) -> Vec<u8> {
     ting_node::wiki::file(&format!("programs/{name}.wasm"))
@@ -245,4 +247,165 @@ fn without_a_wallet_each_command_says_how_to_make_one() {
         assert!(error.contains("wallet create"), "{args:?}: {error}");
     }
     assert!(!dir.0.join(wallet::WALLET_FILE).exists());
+}
+
+/// `ting` in `dir`, which must succeed.
+fn cli(dir: &Directory, args: &[&str]) {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_ting"));
+    command.arg("--data-dir").arg(&dir.0).args(args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+/// A node of the test chain started as `ting start` starts it, and stopped
+/// when the test ends, however it ends.
+struct Started(Directory);
+impl Started {
+    fn new() -> Self {
+        let dir = Directory::new();
+        let genesis = dir.0.join("test.genesis");
+        std::fs::write(&genesis, support::test_genesis().encode()).unwrap();
+        cli(
+            &dir,
+            &[
+                "init",
+                "--genesis",
+                genesis.to_str().unwrap(),
+                "--control",
+                "127.0.0.1:0",
+                "--p2p",
+                "127.0.0.1:0",
+                "--api-bind",
+                "127.0.0.1:0",
+            ],
+        );
+        cli(&dir, &["start"]);
+        Self(dir)
+    }
+    async fn call(&self, method: &str, params: Value) -> Value {
+        let control = Running::load(&self.0.0).unwrap().control;
+        transport::control_call(control, &config::token(&self.0.0).unwrap(), method, params)
+            .await
+            .unwrap()
+    }
+    async fn mine(&self) {
+        self.call("mine", json!({"count":1,"attempts":1_000_000}))
+            .await;
+    }
+}
+impl Drop for Started {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new(env!("CARGO_BIN_EXE_ting"))
+            .arg("--data-dir")
+            .arg(&self.0.0)
+            .arg("stop")
+            .output();
+    }
+}
+
+/// The commands themselves, through a running node's control channel: its
+/// reads, the coin, and what `wallet-sent.json` keeps of the sends.
+#[tokio::test]
+async fn sends_go_through_a_running_node_which_tells_what_became_of_them() {
+    let node = Started::new();
+    let dir = node.0.0.as_path();
+    let chain_id = config::genesis(dir).unwrap().chain_id();
+    let ask = |_: &str| Ok::<_, String>(Zeroizing::new("correct horse battery".to_owned()));
+    let (created, _) = wallet::execute(dir, Command::Create, "ting", &ask)
+        .await
+        .unwrap();
+    let account = ting_node::hash_arg(created["account"].as_str().unwrap()).unwrap();
+    let coin_tx = coin(&[(account, 10_000_000_000)]);
+    let coin_id = hex(&contract_id(&chain_id, &coin_tx));
+    for tx in [policy(), coin_tx] {
+        node.call("submit", json!({"hex":hex(&tx.encode())})).await;
+    }
+    node.mine().await;
+    let balance = || {
+        wallet::execute(
+            dir,
+            Command::Balance {
+                coin: Some(coin_id.clone()),
+            },
+            "ting",
+            &ask,
+        )
+    };
+    let send = |amount: &str| {
+        wallet::execute(
+            dir,
+            Command::Send {
+                account: "aa".repeat(32),
+                amount: amount.into(),
+                fee: None,
+                coin: Some(coin_id.clone()),
+            },
+            "ting",
+            &ask,
+        )
+    };
+    let (held, _) = balance().await.unwrap();
+    assert_eq!(held["balance"], "10000000000");
+    assert_eq!(held["sends"], json!([]));
+    // Two sends in a row, the second taking the nonce after the first; what
+    // they take is not there to send again.
+    let (first, _) = send("1.5").await.unwrap();
+    let (second, _) = send("2").await.unwrap();
+    assert_eq!((&first["nonce"], &second["nonce"]), (&json!(0), &json!(1)));
+    let refused = send("97").await.unwrap_err();
+    assert!(refused.contains("left after"), "{refused}");
+    let (held, _) = balance().await.unwrap();
+    let states: Vec<&Value> = held["sends"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| &s["state"])
+        .collect();
+    assert_eq!(states, [&json!("waiting"), &json!("waiting")], "{held}");
+    // A block takes both. The node names no payout account, so the fees
+    // stay with the account.
+    node.mine().await;
+    let (held, text) = balance().await.unwrap();
+    assert_eq!(held["balance"], "9650000000", "{text}");
+    assert_eq!(held["nonce"], 2);
+    assert_eq!(held["sends"], json!([]), "{text}");
+    // A send the node no longer holds, as after a restart, is told; the next
+    // send takes its nonce again, and is the one a block takes.
+    let (lost, _) = send("1").await.unwrap();
+    cli(&node.0, &["stop"]);
+    cli(&node.0, &["start"]);
+    let (held, _) = balance().await.unwrap();
+    assert_eq!(held["sends"][0]["id"], lost["id"], "{held}");
+    assert_eq!(held["sends"][0]["state"], "not sent", "{held}");
+    let (again, _) = send("1").await.unwrap();
+    assert_eq!(again["nonce"], 2);
+    node.mine().await;
+    let (held, text) = balance().await.unwrap();
+    assert_eq!(
+        (&held["balance"], &held["nonce"]),
+        (&json!("9550000000"), &json!(3)),
+        "{text}"
+    );
+    assert_eq!(held["sends"], json!([]), "{text}");
+}
+
+/// The node's words for a transaction it neither stores nor holds, which the
+/// wallet takes to mean the node let a send go.
+#[test]
+fn the_node_says_a_transaction_it_does_not_know_is_not_found() {
+    let dir = Directory::new();
+    dir.config(false, "wallet");
+    let mut chain = Chain::open(&dir.0, Arc::new(AtomicBool::new(false))).unwrap();
+    let error = chain
+        .request("transaction", json!({"id":hex(&[5; 32])}))
+        .unwrap_err();
+    assert_eq!(error, wallet::NOT_FOUND);
 }

@@ -676,6 +676,11 @@ fn an_account_as_a_wallet_shows_it_becomes_producer_data_paying_it() {
         let refused = payout::payout_producer(wrong).unwrap_err();
         assert!(refused.contains("64 hex digits"), "{wrong}: {refused}");
     }
+    // A coin's two reserved keys are no account: the blocks would pay nobody.
+    for reserved in ["0".repeat(64), format!("{}1", "0".repeat(63))] {
+        let refused = payout::payout_producer(&reserved).unwrap_err();
+        assert!(refused.contains("not an account"), "{reserved}: {refused}");
+    }
     for none in ["", "4f435031", "6d696e6572"] {
         assert_eq!(
             payout::with_payout(json!({"producer_hex":none}))["payout"],

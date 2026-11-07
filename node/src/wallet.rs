@@ -5,7 +5,11 @@
 //! (wiki: programs/conventions, accounts). Sending is a coin transfer that the
 //! key signs (wiki: programs/coin, authorized actions). The key is on disk
 //! only in `wallet.json`, sealed under a password, and nothing shows it.
-use crate::{Result, config, payout::Policy, transport, wiki};
+use crate::{
+    Result, config,
+    payout::{self, Policy},
+    transport, wiki,
+};
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{
     KeyInit, XChaCha20Poly1305, XNonce,
@@ -20,6 +24,7 @@ use serde_json::{Value, json};
 use std::{
     fs::{self, OpenOptions},
     io::{ErrorKind, Write},
+    net::SocketAddr,
     path::Path,
 };
 use ting_core::{
@@ -34,6 +39,8 @@ pub const WALLET_FILE: &str = "wallet.json";
 /// The wallet's last send, from which the next one takes its nonce while the
 /// last one waits for a block.
 const SENT_FILE: &str = "wallet-sent.json";
+/// Held by a send while it reads the account and notes what it sent.
+const SEND_LOCK: &str = "wallet-send.lock";
 /// The budget of a canonical deployment (wiki: programs#canonical-deployment).
 const CANONICAL: Resources = Resources([50_000_000, 64, 16_777_216, 16_777_216]);
 /// A transfer signed with the secp256k1 policy and an uncompressed key costs
@@ -375,10 +382,11 @@ impl WalletFile {
     }
 }
 /// Writes `bytes` to a new file at `path` that only its owner can read:
-/// mode 0600 on Unix, an access list for the current user on Windows. An
-/// existing file is never replaced, and a file that could not be made
-/// private is taken away again. On Unix the directory reaches the disk too,
-/// so that the file is there after a power cut once its account is shown.
+/// mode 0600 on Unix, an access list for the current user on Windows, set
+/// before anything is written. An existing file is never replaced, and one
+/// that cannot be written whole is taken away again. On Unix the directory
+/// is synced too, where its file system can, so that the file is there after
+/// a power cut once its account is shown.
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -390,27 +398,94 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = options
         .open(path)
         .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+    #[cfg(windows)]
+    if let Err(e) = config::owner_only(path) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(e);
+    }
     if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
         drop(file);
         let _ = fs::remove_file(path);
         return Err(format!("cannot write {}: {e}", path.display()));
     }
-    #[cfg(windows)]
-    if let Err(e) = config::owner_only(path) {
-        let _ = fs::remove_file(path);
-        return Err(e);
-    }
+    // Some network and FUSE file systems cannot sync a directory: there the
+    // file's own sync is all there is.
     #[cfg(unix)]
     {
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        fs::File::open(parent)
-            .and_then(|d| d.sync_all())
-            .map_err(|e| format!("cannot sync {}: {e}", parent.display()))?;
+        let _ = fs::File::open(parent).and_then(|d| d.sync_all());
     }
     Ok(())
+}
+
+/// Where a command's password comes from: [`terminal`] for a person.
+pub type Ask<'a> = &'a (dyn Fn(&str) -> Result<Zeroizing<String>> + Sync);
+/// A password typed at the terminal, which it does not show.
+pub fn terminal(prompt: &str) -> Result<Zeroizing<String>> {
+    rpassword::prompt_password(prompt)
+        .map(Zeroizing::new)
+        .map_err(|e| format!("cannot read a password from the terminal: {e}"))
+}
+
+/// The running node of the data directory, over its control channel, found
+/// once for a command.
+struct Node {
+    control: SocketAddr,
+    token: String,
+}
+impl Node {
+    fn of(dir: &Path) -> Result<Self> {
+        Ok(Self {
+            control: config::Running::load(dir)?.control,
+            token: config::token(dir)?,
+        })
+    }
+    async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        transport::control_call(self.control, &self.token, method, params).await
+    }
+    /// The record of `key` in the storage of `contract`, if it has one.
+    async fn record(&self, contract: &Hash, key: &Hash) -> Result<Option<Vec<u8>>> {
+        let answer = self
+            .call("storage", json!({"id":hex(contract),"key":hex(key)}))
+            .await?;
+        answer["value_hex"]
+            .as_str()
+            .map(|v| crate::unhex(v, crate::FRAME_MAX))
+            .transpose()
+    }
+    /// The median timestamp of the node's tip at `height` and the ten blocks
+    /// before it, the genesis counting as height 0 (rules §9.1): every block
+    /// built on the tip is stamped later, so a transaction that expired by
+    /// then can never go in on it.
+    async fn median_time(&self, genesis: u64, height: u64) -> Result<u64> {
+        let from = height.saturating_sub(10).max(1);
+        let mut samples = Vec::new();
+        if height >= from {
+            let count = height + 1 - from;
+            let page = self
+                .call("blocks", json!({"from":from,"limit":count}))
+                .await?;
+            for block in page["items"].as_array().into_iter().flatten() {
+                samples.push(
+                    block["timestamp"]
+                        .as_u64()
+                        .ok_or("a block without a timestamp")?,
+                );
+            }
+            if samples.len() as u64 != count {
+                return Err("the node did not give the blocks behind its tip".into());
+            }
+        }
+        if height < 11 {
+            samples.push(genesis);
+        }
+        samples.sort_unstable();
+        Ok(samples[samples.len() / 2])
+    }
 }
 
 /// A send of the wallet, as `wallet-sent.json` keeps it for a day after it
@@ -429,27 +504,26 @@ struct Sent {
 /// What became of a send, as the node knows it.
 #[derive(Debug, PartialEq)]
 enum Fate {
-    /// The node holds it, or cannot say, and it has not expired: a later
-    /// send takes a nonce after it, and what it takes is spoken for.
+    /// The node holds it, or cannot say, and a block can still take it.
     Waiting,
     /// A block of the best chain took it, and it succeeded.
     Done,
     /// A block took it, and it failed for this reason.
     Failed(String),
-    /// No block took it before it expired.
+    /// No block on the node's tip can take it any more: the median time has
+    /// passed its expiry.
     Expired,
     /// The node no longer holds it and no block took it. Another node may
     /// still have it, until it expires.
     Dropped,
 }
-async fn fate(dir: &Path, sent: &Sent) -> Fate {
-    let found = rpc(dir, "transaction", json!({"id":sent.id})).await;
-    let expired = crate::now() > sent.valid_until;
-    match found {
+/// The node's answer for a transaction it neither stores nor holds
+/// (`reads::finish`); a test pins it.
+pub const NOT_FOUND: &str = "transaction not found";
+async fn fate(node: &Node, sent: &Sent, median: u64) -> Fate {
+    let expired = median >= sent.valid_until;
+    match node.call("transaction", json!({"id":sent.id})).await {
         Ok(found) => {
-            if found["pending"] == true && !expired {
-                return Fate::Waiting;
-            }
             if let Some(receipt) = found["occurrences"]
                 .as_array()
                 .and_then(|o| o.first())
@@ -469,52 +543,77 @@ async fn fate(dir: &Path, sent: &Sent) -> Fate {
             }
             if expired {
                 Fate::Expired
+            } else if found["pending"] == true {
+                Fate::Waiting
             } else {
                 Fate::Dropped
             }
         }
         Err(_) if expired => Fate::Expired,
-        Err(e) if e == "transaction not found" => Fate::Dropped,
+        Err(e) if e == NOT_FOUND => Fate::Dropped,
         // A node that cannot answer may still hold it: a nonce is never
         // signed twice.
         Err(_) => Fate::Waiting,
     }
 }
-/// The sends `wallet-sent.json` keeps; none when it is absent or unreadable.
-fn sends(dir: &Path) -> Vec<Sent> {
-    fs::read(dir.join(SENT_FILE))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+/// The sends `wallet-sent.json` keeps, none without the file. A file that
+/// cannot be read is an error, never taken for none: the sends it holds
+/// may still be waiting.
+fn sends(dir: &Path) -> Result<Vec<Sent>> {
+    let path = dir.join(SENT_FILE);
+    match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+            format!(
+                "{} does not read ({e}); move it aside to send without it",
+                path.display()
+            )
+        }),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+    }
 }
 /// The sends of `account` in `coin`, oldest first, each with its fate.
-async fn fates(dir: &Path, account: &Hash, coin: &Hash) -> Vec<(Sent, Fate)> {
+async fn fates(
+    node: &Node,
+    dir: &Path,
+    account: &Hash,
+    coin: &Hash,
+    median: u64,
+) -> Result<Vec<(Sent, Fate)>> {
     let mut out = Vec::new();
-    for sent in sends(dir) {
+    for sent in sends(dir)? {
         if sent.account == hex(account) && sent.coin == hex(coin) {
-            let fate = fate(dir, &sent).await;
+            let fate = fate(node, &sent, median).await;
             out.push((sent, fate));
         }
     }
-    out
+    Ok(out)
 }
-/// The nonce of the next send and what the waiting sends take from the
-/// account: after the last of them still ahead of the account's nonce.
+/// The nonce of the next send, and what the waiting sends take from the
+/// account. A send goes in only once every nonce below it is used, so the
+/// next one goes after the unbroken run of waiting sends from the account's
+/// nonce: where one before did not go in, it fills that gap. Every waiting
+/// send counts against the balance, as each goes in once the gap below it is
+/// filled.
 fn next(nonce: u64, fates: &[(Sent, Fate)]) -> (u64, u128) {
-    let waiting: Vec<&Sent> = fates
+    let waiting = |n: u64| {
+        fates
+            .iter()
+            .any(|(sent, fate)| *fate == Fate::Waiting && sent.nonce == n)
+    };
+    let mut next = nonce;
+    while waiting(next) {
+        next += 1;
+    }
+    let debit = fates
         .iter()
         .filter(|(sent, fate)| *fate == Fate::Waiting && sent.nonce >= nonce)
-        .map(|(sent, _)| sent)
-        .collect();
-    let next = waiting.iter().map(|s| s.nonce + 1).fold(nonce, u64::max);
-    let debit = waiting
-        .iter()
-        .fold(0u128, |sum, s| sum.saturating_add(s.debit));
+        .fold(0u128, |sum, (sent, _)| sum.saturating_add(sent.debit));
     (next, debit)
 }
 /// Adds `sent` to `wallet-sent.json`, dropping sends that expired a day ago.
 fn record_send(dir: &Path, sent: Sent) -> Result<()> {
-    let mut kept: Vec<Sent> = sends(dir)
+    let mut kept: Vec<Sent> = sends(dir)?
         .into_iter()
         .filter(|s| s.valid_until + 86_400 > crate::now())
         .collect();
@@ -524,24 +623,42 @@ fn record_send(dir: &Path, sent: Sent) -> Result<()> {
         &serde_json::to_vec_pretty(&kept).map_err(|e| e.to_string())?,
     )
 }
-
-/// A password typed at the terminal, which it does not show.
-fn password(prompt: &str) -> Result<Zeroizing<String>> {
-    rpassword::prompt_password(prompt)
-        .map(Zeroizing::new)
-        .map_err(|e| format!("cannot read a password from the terminal: {e}"))
+/// Held while a send reads the account and notes what it sent, so that two
+/// at once never take the same nonce.
+fn send_lock(dir: &Path) -> Result<fs::File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(SEND_LOCK))
+        .map_err(|e| format!("cannot open {SEND_LOCK}: {e}"))?;
+    file.try_lock()
+        .map_err(|_| "another ting wallet send is running for this data directory")?;
+    Ok(file)
 }
-async fn rpc(dir: &Path, method: &str, params: Value) -> Result<Value> {
-    let info = config::Running::load(dir)?;
-    transport::control_call(info.control, &config::token(dir)?, method, params).await
-}
-/// The record of `key` in the storage of `contract`, if it has one.
-async fn record(dir: &Path, contract: &Hash, key: &Hash) -> Result<Option<Vec<u8>>> {
-    let answer = rpc(dir, "storage", json!({"id":hex(contract),"key":hex(key)})).await?;
-    answer["value_hex"]
-        .as_str()
-        .map(|v| crate::unhex(v, crate::FRAME_MAX))
-        .transpose()
+/// What `balance` tells of the sends still ahead of the account's nonce: a
+/// label, the send, and what became of it.
+fn told(nonce: u64, fates: &[(Sent, Fate)]) -> Vec<(&'static str, String, String)> {
+    let (run, _) = next(nonce, fates);
+    fates
+        .iter()
+        .filter(|(sent, _)| sent.nonce >= nonce)
+        .filter_map(|(sent, fate)| {
+            let (label, what) = match fate {
+                Fate::Waiting if sent.nonce < run => ("Waiting", "not in a block yet".into()),
+                Fate::Waiting => ("Held up", "behind a send that did not go in".into()),
+                Fate::Failed(reason) => ("Not sent", format!("failed: {reason}")),
+                Fate::Expired => ("Not sent", "expired with no block taking it".into()),
+                Fate::Dropped => (
+                    "Not sent",
+                    "no longer in this node's pool, nor in a block".into(),
+                ),
+                Fate::Done => return None,
+            };
+            Some((label, sent.id.clone(), what))
+        })
+        .collect()
 }
 
 /// A coin's symbol and decimals, from its configuration record.
@@ -553,7 +670,7 @@ struct Coin {
 impl Coin {
     /// `coin` on the node's chain, by default the first coin `miner.json`
     /// claims; it must run the reference coin program.
-    async fn find(dir: &Path, coin: Option<String>) -> Result<Self> {
+    async fn find(node: &Node, dir: &Path, coin: Option<String>) -> Result<Self> {
         let id = match coin {
             Some(coin) => crate::hash_arg(&coin.to_ascii_lowercase())
                 .map_err(|_| format!("{coin:?} is not a ContractId: 64 hex digits"))?,
@@ -568,7 +685,8 @@ impl Coin {
             }
         };
         let (_, code) = wiki::file("programs/coin.wasm").expect("a bundled program");
-        let contract = rpc(dir, "contract", json!({"id":hex(&id)}))
+        let contract = node
+            .call("contract", json!({"id":hex(&id)}))
             .await
             .map_err(|e| format!("{}: {e}", hex(&id)))?;
         if contract["code_hash"] != json!(hex(&hash("code", code))) {
@@ -577,7 +695,8 @@ impl Coin {
                 hex(&id)
             ));
         }
-        let config = record(dir, &id, &[0; 32])
+        let config = node
+            .record(&id, &[0; 32])
             .await?
             .ok_or("the coin has no configuration record")?;
         let corrupt = || "the coin's configuration record does not decode".to_string();
@@ -624,8 +743,8 @@ struct Holding {
     locked: u128,
     nonce: u64,
 }
-async fn holding(dir: &Path, coin: &Hash, account: &Hash) -> Result<Holding> {
-    let Some(record) = record(dir, coin, account).await? else {
+async fn holding(node: &Node, coin: &Hash, account: &Hash) -> Result<Holding> {
+    let Some(record) = node.record(coin, account).await? else {
         return Ok(Holding {
             balance: 0,
             locked: 0,
@@ -689,23 +808,17 @@ pub fn format_amount(units: u128, decimals: u8) -> String {
     }
     text
 }
-/// An account as a wallet shows it: 64 hex digits, in either case, and not
-/// one of a coin's reserved keys.
-fn account_arg(text: &str) -> Result<Hash> {
-    let account = crate::hash_arg(&text.to_ascii_lowercase())
-        .map_err(|_| format!("{text:?} is not an account: an account is 64 hex digits"))?;
-    let mut state = [0; 32];
-    state[31] = 1;
-    if account == [0; 32] || account == state {
-        return Err(format!("{text} is a coin's own record, not an account"));
-    }
-    Ok(account)
-}
-
 /// Runs `command` on the node in `dir`; returns its result and its text.
-/// `ting` is the command as the person typed it, for the hints.
-pub async fn execute(dir: &Path, command: Command, ting: &str) -> Result<(Value, String)> {
-    let chain = config::genesis(dir)?.chain_id();
+/// `ting` is the command as the person typed it, for the hints, and `ask`
+/// gives the password.
+pub async fn execute(
+    dir: &Path,
+    command: Command,
+    ting: &str,
+    ask: Ask<'_>,
+) -> Result<(Value, String)> {
+    let genesis = config::genesis(dir)?;
+    let chain = genesis.chain_id();
     let policy = policy(chain);
     match command {
         Command::Create => {
@@ -719,13 +832,13 @@ pub async fn execute(dir: &Path, command: Command, ting: &str) -> Result<(Value,
             eprintln!(
                 "The password seals the key in {WALLET_FILE}. Nothing can open it without the password."
             );
-            let first = password("Password: ")?;
+            let first = ask("Password: ")?;
             if first.chars().count() < SHORTEST_PASSWORD {
                 return Err(format!(
                     "a password of at least {SHORTEST_PASSWORD} characters, please"
                 ));
             }
-            if *password("The same password again: ")? != *first {
+            if *ask("The same password again: ")? != *first {
                 return Err("the two passwords differ; nothing was written".into());
             }
             let key = Key::generate()?;
@@ -758,10 +871,14 @@ pub async fn execute(dir: &Path, command: Command, ting: &str) -> Result<(Value,
         Command::Balance { coin } => {
             let file = WalletFile::load(dir, ting)?;
             let account = account(&policy, &file.public_key()?);
-            let status = rpc(dir, "status", json!({})).await?;
-            let coin = Coin::find(dir, coin).await?;
-            let fates = fates(dir, &account, &coin.id).await;
-            let h = holding(dir, &coin.id, &account).await?;
+            let node = Node::of(dir)?;
+            let status = node.call("status", json!({})).await?;
+            let (height, best) = heights(&status);
+            let coin = Coin::find(&node, dir, coin).await?;
+            let median = node.median_time(genesis.timestamp, height).await?;
+            let fates = fates(&node, dir, &account, &coin.id, median).await?;
+            let h = holding(&node, &coin.id, &account).await?;
+            let told = told(h.nonce, &fates);
             let mut lines = vec![
                 ("Account", hex(&account)),
                 ("Balance", coin.show(h.balance)),
@@ -769,25 +886,9 @@ pub async fn execute(dir: &Path, command: Command, ting: &str) -> Result<(Value,
             if h.locked > 0 {
                 lines.push(("Scheduled", coin.show(h.locked)));
             }
-            for (sent, fate) in &fates {
-                if *fate == Fate::Waiting {
-                    lines.push(("Waiting", format!("send {}, not in a block yet", sent.id)));
-                }
+            for (label, id, what) in &told {
+                lines.push((label, format!("send {id}, {what}")));
             }
-            // The last send, if no block took it as it was meant to.
-            let last = fates.last().and_then(|(sent, fate)| {
-                let what = match fate {
-                    Fate::Failed(reason) => format!("failed: {reason}"),
-                    Fate::Expired => "expired with no block taking it".into(),
-                    Fate::Dropped => "is no longer in this node's pool, nor in a block".into(),
-                    Fate::Waiting | Fate::Done => return None,
-                };
-                Some(format!("{} {what}", sent.id))
-            });
-            if let Some(last) = &last {
-                lines.push(("Last send", last.clone()));
-            }
-            let (height, best) = heights(&status);
             lines.push(("At block", crate::log::count(height)));
             let width = lines
                 .iter()
@@ -805,12 +906,14 @@ pub async fn execute(dir: &Path, command: Command, ting: &str) -> Result<(Value,
                     crate::log::count(best)
                 );
             }
+            let sends: Vec<Value> = told
+                .iter()
+                .map(|(label, id, what)| json!({"id":id,"state":label.to_lowercase(),"what":what}))
+                .collect();
             Ok((
                 json!({"account":hex(&account),"coin":hex(&coin.id),"symbol":coin.symbol,
                     "decimals":coin.decimals,"balance":h.balance.to_string(),"locked":h.locked.to_string(),
-                    "nonce":h.nonce,"height":height,
-                    "waiting":fates.iter().filter(|(_, f)| *f == Fate::Waiting).map(|(s, _)| &s.id).collect::<Vec<_>>(),
-                    "last_send":last}),
+                    "nonce":h.nonce,"height":height,"sends":sends}),
                 text,
             ))
         }
@@ -822,12 +925,13 @@ pub async fn execute(dir: &Path, command: Command, ting: &str) -> Result<(Value,
         } => {
             let file = WalletFile::load(dir, ting)?;
             let from = account(&policy, &file.public_key()?);
-            let to = account_arg(&to)?;
+            let to = payout::account_arg(&to)?;
             let named = coin
                 .as_ref()
                 .map(|coin| format!(" --coin {coin}"))
                 .unwrap_or_default();
-            let coin = Coin::find(dir, coin).await?;
+            let node = Node::of(dir)?;
+            let coin = Coin::find(&node, dir, coin).await?;
             let amount = parse_amount(&amount, coin.decimals)?;
             if amount == 0 {
                 return Err("an amount of more than 0, please".into());
@@ -836,7 +940,7 @@ pub async fn execute(dir: &Path, command: Command, ting: &str) -> Result<(Value,
                 Some(fee) => parse_amount(&fee, coin.decimals)?,
                 None => 1,
             };
-            let (height, best) = heights(&rpc(dir, "status", json!({})).await?);
+            let (height, best) = heights(&node.call("status", json!({})).await?);
             if best > height + 2 {
                 return Err(format!(
                     "the node is still catching up with the network, at block {} of {}: send once it has, so that the balance and nonce are current",
@@ -844,15 +948,23 @@ pub async fn execute(dir: &Path, command: Command, ting: &str) -> Result<(Value,
                     crate::log::count(best)
                 ));
             }
-            rpc(dir, "contract", json!({"id":hex(&policy)}))
+            node.call("contract", json!({"id":hex(&policy)}))
                 .await
-                .map_err(|_| "the secp256k1 signature policy is not deployed on this chain, so no key account can sign here")?;
+                .map_err(|e| {
+                    if e == "contract not found" {
+                        "the secp256k1 signature policy is not deployed on this chain, so no key account can sign here".into()
+                    } else {
+                        e
+                    }
+                })?;
+            let _lock = send_lock(dir)?;
             // What still waits is asked before the account's record, so that a
             // send a block takes in between counts in the record.
-            let fates = fates(dir, &from, &coin.id).await;
-            let h = holding(dir, &coin.id, &from).await?;
-            // Sends still waiting go first: this one takes the nonce after
-            // theirs, and what they take is not there to send.
+            let median = node.median_time(genesis.timestamp, height).await?;
+            let fates = fates(&node, dir, &from, &coin.id, median).await?;
+            let h = holding(&node, &coin.id, &from).await?;
+            // This send goes after the waiting ones, and what they take is not
+            // there to send.
             let (nonce, waiting) = next(h.nonce, &fates);
             let available = h.balance.saturating_sub(h.locked).saturating_sub(waiting);
             let needed = amount
@@ -881,7 +993,7 @@ pub async fn execute(dir: &Path, command: Command, ting: &str) -> Result<(Value,
                 hex(&to),
                 coin.show(fee)
             );
-            let key = file.open(&password("Password: ")?)?;
+            let key = file.open(&ask("Password: ")?)?;
             let t = Transfer {
                 coin: coin.id,
                 to,
@@ -892,7 +1004,9 @@ pub async fn execute(dir: &Path, command: Command, ting: &str) -> Result<(Value,
             };
             let tx = transfer(&key, chain, &policy, &t)?;
             drop(key);
-            let result = rpc(dir, "submit", json!({"hex":hex(&tx.encode())})).await?;
+            let result = node
+                .call("submit", json!({"hex":hex(&tx.encode())}))
+                .await?;
             let id = hex(&tx.id(chain));
             let sent = Sent {
                 id: id.clone(),
@@ -930,6 +1044,7 @@ fn heights(status: &Value) -> (u64, u64) {
     let height = status["height"].as_u64().unwrap_or(0);
     (height, status["best_height"].as_u64().unwrap_or(height))
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -991,14 +1106,20 @@ mod tests {
     }
 
     #[test]
-    fn a_send_takes_the_nonce_after_those_still_waiting_and_counts_what_they_take() {
+    fn a_send_fills_the_first_gap_in_the_run_of_waiting_sends() {
         assert_eq!(next(5, &[]), (5, 0));
         // Two waiting in a row: the next goes after both, and both debits
         // are spoken for.
-        let waiting = [(sent(5, 100), Fate::Waiting), (sent(6, 20), Fate::Waiting)];
-        assert_eq!(next(5, &waiting), (7, 120));
+        let run = [(sent(5, 100), Fate::Waiting), (sent(6, 20), Fate::Waiting)];
+        assert_eq!(next(5, &run), (7, 120));
         // One a block took is in the account's record already.
-        assert_eq!(next(6, &waiting), (7, 20));
+        assert_eq!(next(6, &run), (7, 20));
+        // The first expired, so the second can only go in once a send takes
+        // nonce 5: the next one does, and the second then goes in too.
+        let gap = [(sent(5, 100), Fate::Expired), (sent(6, 20), Fate::Waiting)];
+        assert_eq!(next(5, &gap), (5, 20));
+        let labels: Vec<&str> = told(5, &gap).iter().map(|(label, _, _)| *label).collect();
+        assert_eq!(labels, ["Not sent", "Held up"]);
         // Sends that will not go in hold up nothing.
         let gone = [
             (sent(5, 100), Fate::Expired),
@@ -1007,10 +1128,48 @@ mod tests {
             (sent(4, 100), Fate::Done),
         ];
         assert_eq!(next(5, &gone), (5, 0));
+        // A send whose nonce another one used since is told no more.
+        assert!(told(6, &gone).is_empty());
+        assert_eq!(told(5, &run)[1].0, "Waiting");
         // A record of more than a u64 survives the file.
         let big = sent(1, u128::MAX - 1);
         let read: Vec<Sent> = serde_json::from_slice(&serde_json::to_vec(&[big]).unwrap()).unwrap();
         assert_eq!(read[0].debit, u128::MAX - 1);
+    }
+
+    #[test]
+    fn a_wallet_sent_file_that_does_not_read_stops_a_send() {
+        let dir = std::env::temp_dir().join(format!(
+            "ting-wallet-{}-{}",
+            std::process::id(),
+            crate::now()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(sends(&dir).unwrap().is_empty());
+        fs::write(dir.join(SENT_FILE), b"[{\"id\":").unwrap();
+        assert!(sends(&dir).is_err());
+        // Nor is a file that does not read written over.
+        assert!(record_send(&dir, sent(1, 1)).is_err());
+        assert_eq!(fs::read(dir.join(SENT_FILE)).unwrap(), b"[{\"id\":");
+        // Two sends at once: the second waits for none, it stops.
+        let lock = send_lock(&dir).unwrap();
+        assert!(send_lock(&dir).is_err());
+        drop(lock);
+        assert!(send_lock(&dir).is_ok());
+        // A private file: never written over, the owner's alone.
+        let path = dir.join(WALLET_FILE);
+        write_private(&path, b"one").unwrap();
+        assert!(write_private(&path, b"two").is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"one");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1065,20 +1224,6 @@ mod tests {
             format_amount(u128::MAX, 38),
             "3.40282366920938463463374607431768211455"
         );
-    }
-
-    #[test]
-    fn accounts_are_64_hex_digits_and_no_reserved_key() {
-        let account = "31988B503C5177470AAECED6A04A68CAA536C9BB6B4BB22F4240DC1FAD41160B";
-        assert_eq!(
-            hex(&account_arg(account).unwrap()),
-            account.to_ascii_lowercase()
-        );
-        assert!(account_arg(&account[1..]).is_err());
-        assert!(account_arg(&format!("{account}0")).is_err());
-        assert!(account_arg(&account.replace('B', "G")).is_err());
-        assert!(account_arg(&"0".repeat(64)).is_err());
-        assert!(account_arg(&format!("{}1", "0".repeat(63))).is_err());
     }
 
     #[test]

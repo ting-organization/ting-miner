@@ -592,7 +592,7 @@ async fn execute(cli: Cli) -> Result<Option<(Value, String)>> {
             let text = show::docs(&result);
             (result, text)
         }
-        Action::Wallet(command) => wallet::execute(dir, command, &ting).await?,
+        Action::Wallet(command) => wallet::execute(dir, command, &ting, &wallet::terminal).await?,
     };
     Ok(Some(shown))
 }

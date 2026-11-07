@@ -519,6 +519,7 @@ pub async fn control_server(listener: TcpListener, node: Node) {
                     | "storage"
                     | "contract"
                     | "transaction"
+                    | "blocks"
             ) {
                 node.call(method, request["params"].clone()).await
             } else {

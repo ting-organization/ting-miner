@@ -493,13 +493,25 @@ pub fn producer_data(account: &Hash) -> Vec<u8> {
     data.extend(account);
     data
 }
-/// The producer data, in hex, paying `account`: 64 hex digits, as a wallet such
-/// as Ting ID shows an account, in either case (`ting miner payout`).
-pub fn payout_producer(account: &str) -> Result<String> {
-    let account = crate::hash_arg(&account.to_ascii_lowercase()).map_err(|_| {
-        format!("{account:?} is not an account: an account is 32 bytes, 64 hex digits")
+/// An account as a wallet such as Ting ID shows one: 64 hex digits, in either
+/// case. A coin's two reserved keys, `00…00` and `00…01`, are no account: a
+/// payout account there counts as none, and a coin refuses a transfer to them
+/// (wiki: programs/coin, records). `ting miner payout` and `ting wallet send`
+/// both take accounts so.
+pub fn account_arg(text: &str) -> Result<Hash> {
+    let account = crate::hash_arg(&text.to_ascii_lowercase()).map_err(|_| {
+        format!("{text:?} is not an account: an account is 32 bytes, 64 hex digits")
     })?;
-    Ok(hex(&producer_data(&account)))
+    let mut state = [0; 32];
+    state[31] = 1;
+    if account == [0; 32] || account == state {
+        return Err(format!("{text} is a coin's own record, not an account"));
+    }
+    Ok(account)
+}
+/// The producer data, in hex, paying `account` (`ting miner payout`).
+pub fn payout_producer(account: &str) -> Result<String> {
+    Ok(hex(&producer_data(&account_arg(account)?)))
 }
 /// `answer` with `payout`, the payout account its `producer_hex` names, or null
 /// where it names none (`ting miner payout` and `ting miner status`).

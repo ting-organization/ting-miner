@@ -134,17 +134,23 @@ ting wallet send <account> 12.5     # send 12.5 Daler from it
   be in step with the network: `send` refuses while it catches up, since the balance
   and nonce would be old.
 - **Sends in a row.** `wallet-sent.json` notes each send for a day after it expires.
-  A send made while others still wait in the node's pool takes the nonce after
-  theirs, and what they take from the balance is not there to send again. A send
-  that cannot go in, which this miner leaves in its pool rather than in a block,
-  holds up later ones only until it expires. `ting wallet balance` shows the sends
-  still waiting, and a last one that failed, expired or left the pool.
+  A send goes in only once every nonce below it is used, so a new one takes the
+  nonce after the unbroken run of sends still waiting in the node's pool, and what
+  every waiting send takes from the balance is not there to send again. Where a send
+  before did not go in, the new one takes its nonce, and the waiting sends behind it
+  go in after it. A send has expired once the median time of the last eleven blocks
+  has passed its hour, since no later block can include it: until then it may still
+  go in, whatever the clock says. `ting wallet balance` shows each send not yet in a
+  block: waiting, held up behind one that did not go in, or not sent, because it
+  failed, expired or left the pool. One send runs at a time for a data directory;
+  a second at once is refused.
 - `--coin <ContractId>` names another coin than the first `miner.json` claims, which
   is Daler on the production network. `--json` prints each result for scripts; the
   password is still typed at the terminal.
 
-The wallet reads through the node's control channel, which the miner opens to three
-reads for it: `storage`, `contract` and `transaction`.
+The wallet reads through the node's control channel, which the miner opens to four
+reads for it, all of which the REST API serves too: `storage`, `contract`,
+`transaction` and `blocks`.
 
 ## Download a release
 
@@ -264,7 +270,7 @@ The miner changes as little of Ting as it can, so merges stay clean:
   has `ting miner payout`, the payout account in `ting miner status`, the production
   policy `ting init` writes and `ting wallet`, a few lines calling `payout.rs` and
   `wallet.rs`;
-- `node/src/transport.rs` lets the control channel answer the wallet's three reads,
+- `node/src/transport.rs` lets the control channel answer the wallet's four reads,
   and `node/src/config.rs` lends it the owner-only access list it gives
   `control.token` on Windows: a line each;
 - `node/src/show.rs`, the commands' text, shows the miner's searches as
