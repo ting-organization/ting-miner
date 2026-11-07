@@ -41,12 +41,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Both Mac builds run on an Intel Mac: GitHub's Apple silicon runners were too
+          # short of capacity to take free jobs at all. An Intel Mac can't run the Apple
+          # silicon binary, so that one is checked by its architecture instead.
           - target: aarch64-apple-darwin
-            os: macos-latest
-          # Built on Apple silicon as well, where the runner has no Rosetta to run it.
-          - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-15-intel
             cross: true
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
           # In Ubuntu 22.04, whose glibc 2.35 the binary then needs: it runs on the
           # distributions of the last few years, Ubuntu 22.04 and Debian 12 on.
           - target: x86_64-unknown-linux-gnu
@@ -89,9 +91,9 @@ jobs:
       - name: The binary reports the node's version
         if: ${{ !matrix.cross }}
         run: test "$("target/$TARGET/release/ting${{ matrix.exe }}" --version)" = "ting ${{ needs.version.outputs.version }}"
-      - name: The binary is for an Intel Mac
+      - name: The binary is for Apple silicon
         if: matrix.cross
-        run: test "$(lipo -archs "target/$TARGET/release/ting")" = x86_64
+        run: test "$(lipo -archs "target/$TARGET/release/ting")" = arm64
       - name: Package
         run: |
           mkdir -p "dist/$ARCHIVE"
