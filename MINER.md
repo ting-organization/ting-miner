@@ -4,7 +4,7 @@ This repository is the Ting reference node with a mining policy for pay. It is t
 whole Ting implementation, kept in step with [Ting](https://github.com/ting-organization/ting)
 by merging its changes, and the `ting` binary it builds runs, synchronizes and
 validates exactly as Ting's does. Only how a template picks its transactions, and how
-fast the miner finds a nonce for it, differ.
+fast the miner finds a nonce for it, differ, and it has a wallet for the rewards.
 
 ## What it adds
 
@@ -102,6 +102,56 @@ faster. One limit stays Ting's: its miner loop asks a search for 2^30 nonces at 
 time and then builds a new template, so past some tens of GH/s, a handful of fast
 GPUs, building templates starts to take a share of the time.
 
+## The wallet
+
+`ting wallet`, in `node/src/wallet.rs`, keeps one key for the rewards, so that mining
+needs no phone:
+
+```sh
+ting wallet create                  # a new key, and its account
+ting wallet account                 # the account again
+ting wallet balance                 # what it holds of Daler
+ting wallet send <account> 12.5     # send 12.5 Daler from it
+```
+
+- **The account** is a key account as Ting ID makes one: a policy account of the
+  reference `policy-secp256k1` and the key's uncompressed public key
+  ([accounts](node/wiki/programs/conventions.md#accounts)). Any wallet can pay it,
+  and a payment from it is a coin transfer the key signs
+  ([authorized actions](node/wiki/programs/coin.md#authorized-actions)).
+- **The key** is made on this machine and kept in `wallet.json` in the data
+  directory, sealed under the password: Argon2id over 64 MiB turns the password into
+  the key of XChaCha20-Poly1305. Only the public key is in the open. No command shows
+  the key or writes it anywhere else. The file is its owner's alone, as
+  `control.token` is, and `ting wallet create` never replaces one.
+- **Keep a copy** of `wallet.json` somewhere safe, and the password apart from it.
+  Whoever holds both can spend the account; without both, nobody can, you included.
+- **Sending** reads the balance and the account's nonce from the running node, asks
+  for the password and hands the signed transfer to the node, which relays it. It
+  pays the block's producer a fee of the coin's smallest unit unless `--fee` says
+  more, which puts it before the transactions that pay nothing at a paying miner such
+  as this one. A send that no block includes within an hour expires. The node has to
+  be in step with the network: `send` refuses while it catches up, since the balance
+  and nonce would be old.
+- **Sends in a row.** `wallet-sent.json` notes each send for a day after it expires.
+  A send goes in only once every nonce below it is used, so a new one takes the
+  nonce after the unbroken run of sends still waiting in the node's pool, and what
+  every waiting send takes from the balance is not there to send again. Where a send
+  before did not go in, the new one takes its nonce, and the waiting sends behind it
+  go in after it. A send has expired once the median time of the last eleven blocks
+  has passed its hour, since no later block can include it: until then it may still
+  go in, whatever the clock says. `ting wallet balance` shows each send not yet in a
+  block: waiting, held up behind one that did not go in, or not sent, because it
+  failed, expired or left the pool. One send runs at a time for a data directory;
+  a second at once is refused.
+- `--coin <ContractId>` names another coin than the first `miner.json` claims, which
+  is Daler on the production network. `--json` prints each result for scripts; the
+  password is still typed at the terminal.
+
+The wallet reads through the node's control channel, which the miner opens to four
+reads for it, all of which the REST API serves too: `storage`, `contract`,
+`transaction` and `blocks`.
+
 ## Download a release
 
 Each [release](https://github.com/ting-organization/ting-miner/releases) carries the
@@ -185,7 +235,8 @@ The account the blocks pay is set apart from it, with the node running or not:
 ting miner payout <account>
 ```
 
-The account is 64 hex digits, as a wallet shows one: in Ting ID, Receive shows your
+The account is 64 hex digits, as a wallet shows one: `ting wallet create` and `ting
+wallet account` show [the wallet's](#the-wallet), and in Ting ID, Receive shows your
 Spending account. The command sets producer data naming it as the payout account,
 44 bytes ([producer data](node/wiki/programs/conventions.md#producer-data)), and
 answers with the account, as `ting miner payout` alone does and `ting miner status`
@@ -211,20 +262,25 @@ git merge upstream/master
 
 The miner changes as little of Ting as it can, so merges stay clean:
 
-- `node/src/payout.rs`, `node/src/search.rs`, their tests in `node/tests/`,
-  `miner.production.json`, `.github/workflows/release.yml` and this file are the
-  miner's own;
-- `node/src/lib.rs` declares the two modules, and `node/src/main.rs` runs the daemon
-  with `payout::mining` instead of the defaults: a line each. `main.rs` also has
-  `ting miner payout`, the payout account in `ting miner status` and the production
-  policy `ting init` writes, a few lines calling `payout.rs`;
+- `node/src/payout.rs`, `node/src/search.rs`, `node/src/wallet.rs`, their tests in
+  `node/tests/`, `miner.production.json`, `.github/workflows/release.yml` and this
+  file are the miner's own;
+- `node/src/lib.rs` declares the three modules, and `node/src/main.rs` runs the
+  daemon with `payout::mining` instead of the defaults: a line each. `main.rs` also
+  has `ting miner payout`, the payout account in `ting miner status`, the production
+  policy `ting init` writes and `ting wallet`, a few lines calling `payout.rs` and
+  `wallet.rs`;
+- `node/src/transport.rs` lets the control channel answer the wallet's four reads,
+  and `node/src/config.rs` lends it the owner-only access list it gives
+  `control.token` on Windows: a line each;
 - `node/src/show.rs`, the commands' text, shows the miner's searches as
   `search::text` words them and the payout account in `ting miner status`: a line
   each;
 - `README.md` starts with the miner's own part, above Ting's title, which a merge
   leaves alone unless Ting changes that title;
-- `node/Cargo.toml` adds wgpu and pollster under the `gpu` feature, and
-  `Cargo.lock` their crates;
+- `node/Cargo.toml` adds wgpu and pollster under the `gpu` feature, and k256,
+  argon2, chacha20poly1305, zeroize and rpassword for the wallet, and `Cargo.lock`
+  their crates;
 - `src/vm/runtime.rs` gives the block candidate two read-only accessors, `producer`
   and `limits`.
 

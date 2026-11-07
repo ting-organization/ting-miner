@@ -676,6 +676,11 @@ fn an_account_as_a_wallet_shows_it_becomes_producer_data_paying_it() {
         let refused = payout::payout_producer(wrong).unwrap_err();
         assert!(refused.contains("64 hex digits"), "{wrong}: {refused}");
     }
+    // A coin's two reserved keys are no account: the blocks would pay nobody.
+    for reserved in ["0".repeat(64), format!("{}1", "0".repeat(63))] {
+        let refused = payout::payout_producer(&reserved).unwrap_err();
+        assert!(refused.contains("not an account"), "{reserved}: {refused}");
+    }
     for none in ["", "4f435031", "6d696e6572"] {
         assert_eq!(
             payout::with_payout(json!({"producer_hex":none}))["payout"],
@@ -796,6 +801,7 @@ fn a_new_production_node_mines_daler_and_another_network_nothing() {
         "{created}"
     );
     assert!(created.contains("miner payout <account>"), "{created}");
+    assert!(created.contains("wallet create"), "{created}");
     let written = std::fs::read_to_string(production.0.join("miner.json")).unwrap();
     assert_eq!(written, payout::PRODUCTION_POLICY);
     let policy = Policy::load(&production.0).unwrap();
