@@ -130,10 +130,15 @@ ting wallet send <account> 12.5     # send 12.5 Daler from it
   for the password and hands the signed transfer to the node, which relays it. It
   pays the block's producer a fee of the coin's smallest unit unless `--fee` says
   more, which puts it before the transactions that pay nothing at a paying miner such
-  as this one. A send that no block includes within an hour expires. One sent while
-  the last still waits takes the nonce after it, so both go in, in order. The node
-  has to be in step with the network: `send` waits while it catches up, since the
-  balance and nonce would be old.
+  as this one. A send that no block includes within an hour expires. The node has to
+  be in step with the network: `send` refuses while it catches up, since the balance
+  and nonce would be old.
+- **Sends in a row.** `wallet-sent.json` notes each send for a day after it expires.
+  A send made while others still wait in the node's pool takes the nonce after
+  theirs, and what they take from the balance is not there to send again. A send
+  that cannot go in, which this miner leaves in its pool rather than in a block,
+  holds up later ones only until it expires. `ting wallet balance` shows the sends
+  still waiting, and a last one that failed, expired or left the pool.
 - `--coin <ContractId>` names another coin than the first `miner.json` claims, which
   is Daler on the production network. `--json` prints each result for scripts; the
   password is still typed at the terminal.
