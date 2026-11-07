@@ -28,6 +28,13 @@ sha2 = { version = "=0.10.9", features = ["compress"] }
 # ting-miner: the GPU search (src/search.rs), on Metal, Vulkan or DX12.
 wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "metal", "vulkan", "dx12"], optional = true }
 pollster = { version = "=1.0.1", optional = true }
+# ting-miner: the wallet (src/wallet.rs): a secp256k1 key and its signatures,
+# the key sealed on disk under a password, and the password read without echo.
+k256 = { version = "=0.13.4", default-features = false, features = ["ecdsa"] }
+argon2 = { version = "=0.5.3", default-features = false, features = ["alloc", "zeroize"] }
+chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
+zeroize = "=1.8.2"
+rpassword = "=7.5.4"
 
 [features]
 # ting-miner: mine on a GPU where the machine has one; without it, the CPU only.

@@ -17,6 +17,7 @@ pub mod search;
 pub mod seed;
 pub mod store;
 pub mod transport;
+pub mod wallet;
 pub mod web;
 pub mod wiki;
 pub mod wire;

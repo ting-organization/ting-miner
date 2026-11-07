@@ -796,6 +796,7 @@ fn a_new_production_node_mines_daler_and_another_network_nothing() {
         "{created}"
     );
     assert!(created.contains("miner payout <account>"), "{created}");
+    assert!(created.contains("wallet create"), "{created}");
     let written = std::fs::read_to_string(production.0.join("miner.json")).unwrap();
     assert_eq!(written, payout::PRODUCTION_POLICY);
     let policy = Policy::load(&production.0).unwrap();

@@ -515,6 +515,10 @@ pub async fn control_server(listener: TcpListener, node: Node) {
                     | "invalidate"
                     | "reconsider"
                     | "stop"
+                    // ting-miner: the wallet's reads (src/wallet.rs).
+                    | "storage"
+                    | "contract"
+                    | "transaction"
             ) {
                 node.call(method, request["params"].clone()).await
             } else {

@@ -8,23 +8,26 @@ most. [MINER.md](MINER.md) describes what it adds.
 
 ## Start mining
 
-1. **An account for the rewards.** In [Ting ID](https://github.com/ting-organization/ting-id),
-   the wallet for Android, Receive shows your Spending account: 64 hex digits.
-2. **The miner.** Download the archive for your machine from the
+1. **The miner.** Download the archive for your machine from the
    [releases](https://github.com/ting-organization/ting-miner/releases) and unpack
    it; [download a release](MINER.md#download-a-release) says how to check it.
-3. **Mine.** In the unpacked folder:
+2. **Mine.** In the unpacked folder:
 
    ```sh
    ./ting init
-   ./ting miner payout <your Spending account>
+   ./ting wallet create
+   ./ting miner payout <the account it shows>
    ./ting miner start --threads 4
    ./ting start
    ```
 
 `ting init` creates the node in `~/.ting` (`%USERPROFILE%\.ting` on Windows), with a
-`miner.json` that mines Daler (DLR). `ting miner payout` answers with the account the
-blocks will pay: check it against the wallet's. `--threads` is how many of the CPU's
+`miner.json` that mines Daler (DLR). `ting wallet create` asks for a password, seals a
+new key under it in the same folder and shows the key's account;
+[the wallet](MINER.md#the-wallet) says how to keep it and send from it. An account
+from [Ting ID](https://github.com/ting-organization/ting-id), the wallet for Android,
+does as well: Receive shows your Spending account, 64 hex digits. `ting miner payout`
+answers with the account the blocks will pay: check it against the wallet's. `--threads` is how many of the CPU's
 threads the miner may use. The node then joins the production network and catches up
 with it, which the miner waits for, and mines Daler, each block's reward going to
 your account. `./ting miner status` shows the account, the search in use and how
