@@ -326,7 +326,7 @@ pub fn protect_token(dir: &Path) -> Result<()> {
 }
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn owner_only(path: &Path) -> Result<()> {
+pub(crate) fn owner_only(path: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::{
         Foundation::{CloseHandle, HANDLE},
@@ -400,7 +400,8 @@ fn owner_only(path: &Path) -> Result<()> {
     };
     if status != 0 {
         return Err(format!(
-            "setting the token file's access list: {}",
+            "setting the access list of {}: {}",
+            path.display(),
             std::io::Error::from_raw_os_error(status as i32)
         ));
     }

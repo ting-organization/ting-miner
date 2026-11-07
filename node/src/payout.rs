@@ -110,8 +110,9 @@ pub fn initialize(dir: &Path) -> Result<bool> {
 /// the command as the person typed it.
 pub fn initialized(ting: &str) -> String {
     format!(
-        "\nIts {POLICY_FILE} mines Daler (DLR). Name the account the blocks pay with:\n  \
-         {ting} miner payout <account>\n"
+        "\nIts {POLICY_FILE} mines Daler (DLR). Make an account for the rewards, if you\n\
+         have none, and name it as the one the blocks pay:\n  \
+         {ting} wallet create\n  {ting} miner payout <account>\n"
     )
 }
 

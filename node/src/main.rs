@@ -10,7 +10,7 @@ use std::{
 use ting_node::{
     Result,
     config::{self, Config, Running},
-    daemon, payout, transport,
+    daemon, payout, transport, wallet,
 };
 
 mod show;
@@ -119,6 +119,10 @@ enum Action {
     },
     /// Show enabled wiki and API documentation URLs.
     Docs,
+    /// The wallet: a key whose account the blocks can pay, its balance, and
+    /// sending from it.
+    #[command(subcommand)]
+    Wallet(wallet::Command),
 }
 #[derive(Subcommand)]
 enum PeerCommand {
@@ -588,6 +592,7 @@ async fn execute(cli: Cli) -> Result<Option<(Value, String)>> {
             let text = show::docs(&result);
             (result, text)
         }
+        Action::Wallet(command) => wallet::execute(dir, command, &ting).await?,
     };
     Ok(Some(shown))
 }
